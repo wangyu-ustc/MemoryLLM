@@ -1,0 +1,18 @@
+{
+    "longlora-7b-8k": 8192,
+    "longlora-7b-16k": 16384,
+    "longlora-7b-100k": 100000,
+    "longllama-3b": 8192,
+    "longllama-3b-v2": 8192,
+    "openllama-3b-2k": 1500,
+    "openllama-3b-v2-2k": 1500,
+    "llama2-7b-4k": 3500,
+    "llama2-7b-chat-4k": 3500,
+    "longchat-v1.5-7b-32k": 31500,
+    "xgen-7b-8k": 7500,
+    "internlm-7b-8k": 7500,
+    "chatglm2-6b": 31500,
+    "chatglm2-6b-32k": 31500,
+    "vicuna-v1.5-7b-16k": 15500,
+    "memoryllm-7b": 100000
+}

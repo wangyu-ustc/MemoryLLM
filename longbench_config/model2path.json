@@ -1,0 +1,18 @@
+{
+    "longlora-7b-8k": "Yukang/Llama-2-7b-longlora-8k-ft",
+    "longlora-7b-16k": "Yukang/Llama-2-7b-longlora-16k-ft",
+    "longlora-7b-100k": "Yukang/Llama-2-7b-longlora-100k-ft",
+    "longllama-3b": "/fsx-Training/shopqa-training-fsx-prod-us-east-1/wangyuu/transformer_models/longllama-3b",
+    "longllama-3b-v2": "/fsx-Training/shopqa-training-fsx-prod-us-east-1/wangyuu/transformer_models/longllama-3b-v2",
+    "openllama-3b-2k": "/fsx-Training/shopqa-training-fsx-prod-us-east-1/wangyuu/transformer_models/openllama-3b",
+    "openllama-3b-v2-2k": "/fsx-Training/shopqa-training-fsx-prod-us-east-1/wangyuu/transformer_models/openllama-3b-v2",
+    "llama2-7b-chat-4k": "/fsx-Training/shopqa-training-fsx-prod-us-east-1/wangyuu/transformer_models/llama2-7b-chat",
+    "llama2-7b-4k": "meta-llama/Llama-2-7b-hf",
+    "longchat-v1.5-7b-32k": "lmsys/longchat-7b-v1.5-32k",
+    "xgen-7b-8k": "Salesforce/xgen-7b-8k-inst",
+    "internlm-7b-8k": "internlm/internlm-chat-7b-8k",
+    "chatglm2-6b": "THUDM/chatglm2-6b",
+    "chatglm2-6b-32k": "THUDM/chatglm2-6b-32k",
+    "vicuna-v1.5-7b-16k": "lmsys/vicuna-7b-v1.5-16k",
+    "memoryllm-7b": "YuWangX/memoryllm-7b"
+}
