@@ -1,7 +1,7 @@
 # MemoryLLM: Towards Self-Updatable Large Language Models
 
-This is the official code for the paper:  
-**MemoryLLM: Towards Self-Updatable Large Language Models**. 
+This is the official code for the paper: **MemoryLLM: Towards Self-Updatable Large Language Models**.   
+The model is open-sourced at https://huggingface.co/YuWangX/memoryllm-7b
 
 # Load Model
 First clone the repository and get into the repository: 
