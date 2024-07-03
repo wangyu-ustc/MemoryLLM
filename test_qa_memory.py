@@ -10,23 +10,14 @@ from omegaconf import OmegaConf
 from collections import OrderedDict
 import copy
 from transformers import LlamaTokenizer
-# from MemoryLLM.memoryllm.util import instantiate_from_config, collate_fn_qa, collate_fn_qa_bs
 from modeling_memoryllm import MemoryLLM
 from torch.utils.data import Dataset, DataLoader
 from dataset.nq import NQDataset
 from dataset.squad import SQuADDataset
-from dataset.boolq import BoolQDataset
-from dataset.babi import BabiDataset
-from dataset.c4 import MemoryDatasetValid
-# import pytorch_lightning as pl
 import json
 import pandas as pd
-from sklearn import metrics
 from tqdm import tqdm
 from functools import partial
-import torch.nn as nn
-from evaluate import load
-import logging
 
 
 

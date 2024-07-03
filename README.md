@@ -2,7 +2,7 @@
 
 This is the official code for the paper **MemoryLLM: Towards Self-Updatable Large Language Models**. 
 
-# Load Model
+## Load Model
 First clone the repository and get into the repository: 
 ```
 git clone git@github.com:wangyu-ustc/MemoryLLM.git
@@ -18,7 +18,7 @@ model = MemoryLLM.from_pretrained("YuWangX/memoryllm-7b")
 tokenizer = LlamaTokenizer.from_pretrained("YuWangX/memoryllm-7b")
 ```
 
-# How to use the model
+## How to use the model
 Inject a piece of context into the model using the following script:
 ```
 model = model.cuda()
@@ -40,11 +40,23 @@ print(tokenizer.decode(outputs[0]))
 
 ## Evaluation
 
-## Model Editing Evaluations
+### Model Editing Evaluations
 We put our reimplementation of various model-editing baselines and `MemoryLLM` in the repo [EditingLlama](https://github.com/wangyu-ustc/EditingLlama). 
 
-### Synthetic Experiments
-To evaluate the model, we could use the following script: 
+### Customized Experiments
+To prepare the dataset, please download from [here](YuWangX/KnowledgeRetention). Please download the dataset and put them as the following structure: 
+```
+- data
+  - squad
+    - indices_squad_3.npy
+    - dev-v2.0.json
+    - train-v2.0.json
+  - nq 
+    - indices_nq_4.npy
+    - v1.0-simplified_nq-dev-all.jsonl
+    - v1.0-simplified_simplified-nq-train.jsonl
+```
+We will evaluate our model on the validation set where the unrelated contexts are sampled from the training set. To evaluate the model, we could use the following script: 
 
 ```
 mkdir results
