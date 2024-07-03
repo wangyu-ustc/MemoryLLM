@@ -1,6 +1,7 @@
 # MemoryLLM: Towards Self-Updatable Large Language Models
 
-This is the official code for the paper **MemoryLLM: Towards Self-Updatable Large Language Models**. 
+This is the official code for the paper: **MemoryLLM: Towards Self-Updatable Large Language Models**.   
+The model is open-sourced at https://huggingface.co/YuWangX/memoryllm-7b
 
 ## Load Model
 First clone the repository and get into the repository: 
@@ -29,7 +30,7 @@ model.inject_memory(tokenizer(context, return_tensors='pt', add_special_tokens=F
 
 # Generation
 import torch
-input_ids = tokenizer("What fruits do David like? Answer:", return_tensors='pt', add_special_tokens=False).input_ids
+input_ids = tokenizer("What fruits does David like? Answer:", return_tensors='pt', add_special_tokens=False).input_ids
 attention_mask = torch.cat([
     torch.ones(input_ids.shape[0], model.num_tokens * model.num_blocks),
     torch.ones_like(input_ids)
