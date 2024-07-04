@@ -3,21 +3,18 @@ import numpy as np
 import time
 import copy
 import torch
-from tqdm import tqdm
 import pytorch_lightning as pl
 from collections import OrderedDict
 from packaging import version
 from omegaconf import OmegaConf
-from torch.utils.data import random_split, DataLoader, Dataset, Subset
+from torch.utils.data import DataLoader, Dataset
 from functools import partial
 
 from pytorch_lightning import seed_everything
 from pytorch_lightning.trainer import Trainer
 from pytorch_lightning.callbacks import ModelCheckpoint, Callback, LearningRateMonitor
-from pytorch_lightning.utilities.rank_zero import rank_zero_only
 from pytorch_lightning.utilities import rank_zero_info
-# from pytorch_lightning.plugins import DDPPlugin
-from pytorch_lightning.strategies.ddp import DDPStrategy
+from torch.utils.data import IterableDataset
 
 from MemoryLLM.memoryllm.util import instantiate_from_config, collate_fn_qa
 
@@ -149,10 +146,6 @@ def get_parser(**parser_kwargs):
 
 def nondefault_trainer_args(opt):
     parser = argparse.ArgumentParser()
-    
-    # 1.9.0: 
-    parser = Trainer.add_argparse_args(parser)
-    
     args = parser.parse_args([])
     return sorted(k for k in vars(args) if getattr(opt, k) != getattr(args, k))
 
@@ -175,11 +168,19 @@ def worker_init_fn(_):
     worker_id = worker_info.id
     return np.random.seed(np.random.get_state()[1][0] + worker_id)
 
+def worker_init_fn_redpajama(worker_id):
+    worker_info = torch.utils.data.get_worker_info()
+    dataset = worker_info.dataset # the dataset copy in this worker process
+    all_dataset = len(dataset.all_paths)
+    per_worker = all_dataset // worker_info.num_workers
+    dataset.all_paths = dataset.all_paths[worker_id * per_worker: (worker_id + 1) * per_worker]
+
 class DataModuleFromConfig(pl.LightningDataModule):
     def __init__(self, batch_size, num_tokens, eval_batch_size=None, eval_max_length=None, run_qa=False, add_special_tokens=False, end_special_token=None, 
                  train=None, validation=None, test=None, predict=None, wrap=False, num_workers=None, 
                  shuffle_test_loader=False, use_worker_init_fn=False, mask_strategy=None, mask_ratio=0.0,
-                 shuffle_val_dataloader=False, pad_to_max_length=False, add_mask_token=False, add_pad_token=False, collate_fn='none'):
+                 shuffle_val_dataloader=False, pad_to_max_length=False, add_mask_token=False, add_pad_token=False, 
+                 add_memory_token=False, collate_fn='none', worker_init_fn="worker_init_fn_redpajama"):
         super().__init__()
         self.batch_size = batch_size
         self.num_tokens = num_tokens
@@ -187,18 +188,19 @@ class DataModuleFromConfig(pl.LightningDataModule):
         self.end_special_token = end_special_token
         self.pad_to_max_length = pad_to_max_length
         self.add_pad_token = add_pad_token
+        self.add_memory_token = add_memory_token
         self.run_qa = run_qa
         self.mask_strategy = mask_strategy
         self.mask_ratio = mask_ratio
         self.dataset_configs = dict()
         self.num_workers = num_workers if num_workers is not None else batch_size * 2
         self.use_worker_init_fn = use_worker_init_fn
+        self.worker_init_fn = worker_init_fn
         self.eval_batch_size = eval_batch_size if eval_batch_size is not None else batch_size
         self.add_mask_token = add_mask_token or mask_ratio > 0
         # TODO: not sure if max_length can be accessed
         self.eval_max_length = self.datasets['train'].max_length if eval_max_length is None else eval_max_length
         self.collate_fn = collate_fn
-
 
         if train is not None:
             self.dataset_configs["train"] = train
@@ -235,14 +237,19 @@ class DataModuleFromConfig(pl.LightningDataModule):
 
     def _train_dataloader(self):
         if self.use_worker_init_fn:
-            init_fn = worker_init_fn
+            init_fn = eval(self.worker_init_fn)
         else:
             init_fn = None
 
-        if self.add_mask_token > 0:
+        if self.add_mask_token:
             if self.datasets['train'].tokenizer.mask_token is None:
                 self.datasets['train'].tokenizer.add_special_tokens({'mask_token': '<mask>'})
         
+        if self.add_memory_token: 
+            if not hasattr(self.datasets['train'].tokenizer, 'memory_token_id'):
+                self.datasets['train'].tokenzer.add_tokens("<mem>")
+                self.datasets['train'].tokenzer.memory_token_id = self.datasets['train'].tokenzer.convert_tokens_to_ids('<mem>')
+
         if self.add_pad_token:
             if self.datasets['train'].tokenizer.pad_token is None or self.datasets['train'].tokenizer.pad_token == self.datasets['train'].tokenizer.eos_token:
                 self.datasets['train'].tokenizer.add_special_tokens({'pad_token': '<pad>'})
@@ -262,9 +269,14 @@ class DataModuleFromConfig(pl.LightningDataModule):
         else:
             collate_fn_with_params = None
 
-        return DataLoader(self.datasets["train"], batch_size=self.batch_size,
-                        num_workers=self.num_workers, shuffle=True,
-                        worker_init_fn=init_fn, collate_fn=collate_fn_with_params)
+        if isinstance(self.datasets['train'], IterableDataset):
+            return DataLoader(self.datasets["train"], batch_size=self.batch_size,
+                            num_workers=self.num_workers,
+                            worker_init_fn=init_fn, collate_fn=collate_fn_with_params)
+        else:
+            return DataLoader(self.datasets["train"], batch_size=self.batch_size,
+                            num_workers=self.num_workers, shuffle=True,
+                            worker_init_fn=init_fn, collate_fn=collate_fn_with_params)
 
     def _val_dataloader(self, shuffle=False):
         if self.use_worker_init_fn:
@@ -279,6 +291,13 @@ class DataModuleFromConfig(pl.LightningDataModule):
         if self.add_pad_token:
             if self.datasets['train'].tokenizer.pad_token is None or self.datasets['train'].tokenizer.pad_token == self.datasets['train'].tokenizer.eos_token:
                 self.datasets['train'].tokenizer.add_special_tokens({'pad_token': '<pad>'})
+        else:
+            self.datasets['train'].tokenizer.pad_token = self.datasets['train'].tokenizer.eos_token
+
+        if self.add_memory_token:
+            if not hasattr(self.datasets['train'].tokenizer, 'memory_token_id'):
+                self.datasets['train'].tokenizer.add_tokens("<mem>")
+                self.datasets['train'].tokenizer.memory_token_id = self.datasets['train'].tokenizer.convert_tokens_to_ids('<mem>')
 
         collate_fn_with_params = partial(collate_fn_qa, 
             tokenizer=self.datasets['train'].tokenizer, 
@@ -401,47 +420,6 @@ class CUDACallback(Callback):
 
 
 if __name__ == '__main__':
-    # torch.autograd.set_detect_anomaly(True)
-    # custom parser to specify config files, train, test and debug mode,
-    # postfix, resume.
-    # `--key value` arguments are interpreted as arguments to the trainer.
-    # `nested.key=value` arguments are interpreted as config parameters.
-    # configs are merged from left-to-right followed by command line parameters.
-
-    # model:
-    #   base_learning_rate: float
-    #   target: path to lightning module
-    #   params:
-    #       key: value
-    # data:
-    #   target: main.DataModuleFromConfig
-    #   params:
-    #      batch_size: int
-    #      wrap: bool
-    #      train:
-    #          target: path to train dataset
-    #          params:
-    #              key: value
-    #      validation:
-    #          target: path to validation dataset
-    #          params:
-    #              key: value
-    #      test:
-    #          target: path to test dataset
-    #          params:
-    #              key: value
-    # lightning: (optional, has sane defaults and can be specified on cmdline)
-    #   trainer:
-    #       additional arguments to trainer
-    #   logger:
-    #       logger to instantiate
-    #   modelcheckpoint:
-    #       modelcheckpoint to instantiate
-    #   callbacks:
-    #       callback1:
-    #           target: importpath
-    #           params:
-    #               key: value
 
     now = datetime.datetime.now().strftime("%Y-%m-%dT%H-%M-%S")
     # add cwd for convenience and to make classes in this file available when
@@ -450,9 +428,6 @@ if __name__ == '__main__':
     sys.path.append(os.getcwd())
 
     parser = get_parser()
-
-    # 1.9.0:
-    parser = Trainer.add_argparse_args(parser)
 
     opt, unknown = parser.parse_known_args()
     if opt.name and opt.resume:
@@ -489,7 +464,9 @@ if __name__ == '__main__':
         opt.base = base_configs + opt.base
         _tmp = logdir.split("/")
         nowname = _tmp[-1]
+
     else:
+        
         if opt.name:
             name = "_" + opt.name
         elif opt.base:
@@ -720,36 +697,6 @@ if __name__ == '__main__':
         # data.prepare_data()
 
         data.setup()
-        print("#### Data #####")
-        for k in data.datasets:
-            print(f"{k}, {data.datasets[k].__class__.__name__}, {len(data.datasets[k])}")
-
-        # ########### dataloader statistics: ######################
-        # context_lengths = []
-        # sequence_lengths = []
-        # for idx, batch in tqdm(enumerate(data.train_dataloader().loader1), total=1000):
-        #     context, context_mask, sequence, sequence_mask, _ = batch
-        #     context_lengths.extend(context_mask.sum(dim=1).tolist())
-        #     sequence_lengths.extend(sequence_mask.sum(dim=1).tolist())
-        #     if idx > 1000:
-        #         break
-        
-        # # print the maximum, minimum, std, average of the lengths:
-        # print("Context:")
-        # print(max(context_lengths))
-        # print(min(context_lengths))
-        # print(np.mean(context_lengths))
-        # print(np.std(context_lengths))
-
-        # print("Sequence:")
-        # print(max(sequence_lengths))
-        # print(min(sequence_lengths))
-        # print(np.mean(sequence_lengths))
-        # print(np.std(sequence_lengths))
-        # #######################################################
-
-        # set the dataset to be one attribute of the model
-        # model.train_dataset = data.datasets['train'].data
 
         # configure learning rate
         bs, base_lr = config.data.params.batch_size, config.model.base_learning_rate
@@ -794,8 +741,8 @@ if __name__ == '__main__':
             
         def divein(*args, **kwargs):
             if trainer.global_rank == 0:
-                import pudb;
-                pudb.set_trace()
+                import ipdb;
+                ipdb.set_trace()
 
 
         import signal
