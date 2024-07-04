@@ -114,10 +114,13 @@ python main.py -t --base MemoryLLM/configs/openllama/openllama_4x256.yaml
 ## Citations
 If you find this repo helpful, please consider cite our paper:
 ```
-@article{wang2024memoryllm,
-  title={MEMORYLLM: Towards Self-Updatable Large Language Models},
-  author={Wang, Yu and Chen, Xiusi and Shang, Jingbo and McAuley, Julian},
-  journal={arXiv preprint arXiv:2402.04624},
-  year={2024}
+@misc{memoryllm,
+      title={MEMORYLLM: Towards Self-Updatable Large Language Models}, 
+      author={Yu Wang and Yifan Gao and Xiusi Chen and Haoming Jiang and Shiyang Li and Jingfeng Yang and Qingyu Yin and Zheng Li and Xian Li and Bing Yin and Jingbo Shang and Julian McAuley},
+      year={2024},
+      eprint={2402.04624},
+      archivePrefix={arXiv},
+      primaryClass={cs.CL},
+      url={https://arxiv.org/abs/2402.04624}, 
 }
 ```
