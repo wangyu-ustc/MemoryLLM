@@ -280,7 +280,8 @@ class BaseMemoryModelPL(pl.LightningModule):
 
                 if len(contexts_ids) > 1:
 
-                    all_delta_memory = []
+                    # all_delta_memory = []
+                    all_delta_memory = None
                     delta_memory = None
 
                     if self.shuffle_contexts and labels[0] == 0:
@@ -306,11 +307,16 @@ class BaseMemoryModelPL(pl.LightningModule):
                         else:
                             delta_memory = output.delta_memory
 
-                        all_delta_memory = [self.model.drop_memory(dm[0]).unsqueeze(0) for dm in all_delta_memory]
+                        if all_delta_memory is None:
+                            all_delta_memory = delta_memory
+                        else:
+                            all_delta_memory = self.model.drop_memory(all_delta_memory[0]).unsqueeze(0)
+                            all_delta_memory = torch.cat([
+                                all_delta_memory,
+                                delta_memory
+                            ], dim=2)
 
-                        all_delta_memory.append(delta_memory)
-
-                    delta_memory = torch.cat(all_delta_memory, dim=2).detach()
+                    delta_memory = all_delta_memory.detach()
                     torch.cuda.empty_cache()
 
                     if self.detach_additional_memory:
