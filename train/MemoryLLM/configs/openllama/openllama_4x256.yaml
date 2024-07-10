@@ -14,19 +14,12 @@ model:
       target_modules: ['q_proj', 'v_proj', 'k_proj', 'up_proj', 'down_proj', 'gate_proj']
     module_name: LlamaDropMemoryModel
     model_path: openlm-research/open_llama_3b_v2
-    add_positional_embedding: true
-    split_positional_embedding: true
-    # reuse_memory_for_every_layer: true
-    half_layers: false
     add_bos_embedding: true
     cat_memories: false
     cat_and_drop_memory: true
     shuffle_contexts: false
     detach_additional_memory: false
-    # cache_data_for_longer_context: false
     cache_data_for_longer_context: true
-    # interpolate_position_ids: true
-    new_memory_embedding_fullset: true
     shrink_to_one_embedding: true
     occassionally_cat_memory_when_one_context_ratio: 0.5
     drop_memory_per_layer: true
@@ -38,9 +31,6 @@ model:
     validation_dataset_names:
       - naturalqa
       - squad
-    # ckpt_path: logs/2024-04-26T11-47-50_openllama_5x256/checkpoints/epoch=000000.ckpt
-    # ckpt_path: ../models_to_export/llama2_30x256_linear_correct_poe
-    ckpt_path: logs/2024-06-21T08-01-28_openllama_4x256/checkpoints/epoch=000002.ckpt
 
 data:
   target: main.DataModuleFromConfig

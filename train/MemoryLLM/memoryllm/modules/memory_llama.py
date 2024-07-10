@@ -12,8 +12,6 @@ from transformers.utils import logging
 
 logger = logging.get_logger(__name__)
 
-import torch.nn.init as init
-
 class LlamaDropMemoryModel(LlamaForCausalLM, BaseMemoryModel):
     def __init__(self, config):
         LlamaForCausalLM.__init__(self, config)
@@ -22,79 +20,33 @@ class LlamaDropMemoryModel(LlamaForCausalLM, BaseMemoryModel):
         self.config = config
         self.L = config.num_hidden_layers
         self.d = config.hidden_size
-        # self.model = self.model
         self.num_blocks = config.num_blocks
         self.num_tokens = config.num_tokens
-        self.share_memory = False
 
-        self.add_pad_token = config.add_pad_token if hasattr(config, "add_pad_token") else False
-        self.pad_to_max_length = config.pad_to_max_length if hasattr(config, "pad_to_max_length") else False
         self.add_bos_embedding = config.add_bos_embedding
         self.shrink_to_one_embedding = config.shrink_to_one_embedding
-        self.split_positional_embedding = config.split_positional_embedding
-        self.new_memory_embedding_fullset = config.new_memory_embedding_fullset
-        self.pad_token_id = config.pad_token_id
-        self.put_memory_on_cpu = config.put_memory_on_cpu
-        self.share_position_ids = config.share_position_ids if hasattr(config, "share_position_ids") else False
-        self.additional_transformer = config.additional_transformer if hasattr(config, "additional_transformer") else False
-        self.split_encoder_decoder = config.split_encoder_decoder if hasattr(config, "split_encoder_decoder") else False
-        self.reuse_memory_for_every_layer = config.reuse_memory_for_every_layer if hasattr(config, "reuse_memory_for_every_layer") else False
-        self.half_layers = config.half_layers if hasattr(config, "half_layers") else False
         self.drop_memory_per_layer = config.drop_memory_per_layer if hasattr(config, "drop_memory_per_layer") else False
-
-        if self.split_encoder_decoder: 
-            # encoder is self.model, then copy this whole model to be self.decoder:
-            self.decoder = copy.deepcopy(self.model)
-
-        # This is a debug feature
-        self.exclude_layers = []
-
-        if self.reuse_memory_for_every_layer:
-            memory_num = 1
-        elif self.half_layers:
-            memory_num = self.L // 2
-        else:
-            memory_num = self.L
-
-        if self.put_memory_on_cpu:
-            self.memory = torch.randn([memory_num, self.num_blocks * self.num_tokens, self.d])
-        else:
-            self.memory = nn.Parameter(torch.randn([memory_num, self.num_blocks * self.num_tokens, self.d]))
         
+        self.memory = nn.Parameter(torch.randn([self.L, self.num_blocks * self.num_tokens, self.d]))
         print(f"Memory Pool Parameters: {len(self.memory.reshape(-1)) / 1_000_000_000:.4f} B")
         self.register_buffer("initialized", torch.tensor(0, dtype=torch.uint8))
         self.memory.requires_grad = False
         self.add_positional_embedding = False
 
-        if not self.add_pad_token:
-            if self.new_memory_embedding_fullset:
-                if self.shrink_to_one_embedding:
-                    self.new_memory_positional_emb = nn.Parameter(torch.zeros([1, 1, self.d]))
-                    # self.new_memory_positional_emb = nn.Parameter(torch.randn([1, 1, self.d]))
-                else:
-                    # self.new_memory_positional_emb = nn.Parameter(torch.zeros([1, self.num_tokens, self.d]))
-                    
-                    # only for llama2, randn, for others, should be zeros
-                    # for llama2, randn won't help training, but it will prevent the appearance of nan
-                    self.new_memory_positional_emb = nn.Parameter(torch.randn([1, self.num_tokens, self.d])) # this is lethal
-
-            else:
-                self.memory_token_start_indication_embedding = nn.Parameter(torch.randn([self.d]))
+        if self.shrink_to_one_embedding:
+            self.new_memory_positional_emb = nn.Parameter(torch.zeros([1, 1, self.d]))
+        else:
+            # only for llama2, randn, for others, should be zeros
+            # for llama2, randn won't help training, but it will prevent the appearance of nan
+            self.new_memory_positional_emb = nn.Parameter(torch.randn([1, self.num_tokens, self.d])) # this is lethal
 
         if config.add_bos_embedding:
             self.bos_embedding = nn.Parameter(torch.randn([self.L, 1, self.d]))
             self.bos_embedding.data[0, :] = self.model.embed_tokens.weight.data[1]
             self.bos_embedding = nn.Parameter(self.bos_embedding)
 
-        if self.additional_transformer:
-            self.transformer_layer = LlamaDecoderLayer(config)
-
     def set_exclude_layers(self, layer_indices):
         self.exclude_layers = layer_indices
-
-    def convert_memory_to_cpu(self):
-        self.memory = nn.Parameter(self.memory.to("cpu"))
-        self.put_memory_on_cpu = True
 
     def super_forward(self, *args, **kwargs):
         return LlamaForCausalLM.forward(self, *args, **kwargs)
@@ -116,7 +68,6 @@ class LlamaDropMemoryModel(LlamaForCausalLM, BaseMemoryModel):
         is_injection: Optional[bool] = None,
         detach_indices: Optional[torch.LongTensor] = None,
         cat_memory_when_one_context: Optional[bool] = False,
-        random_drop_layer_ratio: Optional[float] = None,
     ) -> Union[Tuple, MemoryLMOutputWithPastAndCrossAttentions]:
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
@@ -181,13 +132,6 @@ class LlamaDropMemoryModel(LlamaForCausalLM, BaseMemoryModel):
 
             prefix_token_length = 0
 
-            if self.half_layers:
-                attention_mask_for_first_half = attention_mask[:, :attention_mask.shape[1] - self.num_tokens * self.num_blocks]
-                attention_mask_for_first_half = model._prepare_decoder_attention_mask(
-                    attention_mask_for_first_half, (batch_size, seq_length), inputs_embeds, past_key_values_length - self.num_tokens * self.num_blocks, 
-                )
-                position_ids_for_first_half = position_ids - self.num_tokens * self.num_blocks
-
             attention_mask = model._prepare_decoder_attention_mask(
                 attention_mask, (batch_size, seq_length), inputs_embeds, past_key_values_length, 
             )
@@ -216,20 +160,12 @@ class LlamaDropMemoryModel(LlamaForCausalLM, BaseMemoryModel):
             position_ids = torch.arange(
                 past_key_values_length, position_length + past_key_values_length, dtype=torch.long, device=device
             )
-            if self.half_layers:
-                position_ids_for_first_half = torch.arange(
-                    past_key_values_length, input_ids.shape[1] + int(self.add_bos_embedding) + past_key_values_length, dtype=torch.long, device=device
-                )            
-
             if attention_mask is None:
                 attention_mask = torch.ones(
                     (batch_size, position_length - int(self.add_bos_embedding)), dtype=torch.bool, device=inputs_embeds.device
                 )
         
             position_ids = position_ids.unsqueeze(0).view(-1, position_length)
-
-            if self.half_layers:
-                position_ids_for_first_half = position_ids_for_first_half.unsqueeze(0).view(-1, input_ids.shape[1] + int(self.add_bos_embedding))
 
             if not self.initialized:
                 if is_injection:
@@ -275,12 +211,6 @@ class LlamaDropMemoryModel(LlamaForCausalLM, BaseMemoryModel):
             else:
                 prefix_token_length = 0
 
-            if self.half_layers:
-                attention_mask_for_first_half = attention_mask[:, :attention_mask.shape[1] - self.num_tokens * self.num_blocks]
-                attention_mask_for_first_half = model._prepare_decoder_attention_mask(
-                    attention_mask_for_first_half, (batch_size, attention_mask_for_first_half.shape[1]), inputs_embeds, past_key_values_length, 
-                )
-            
             attention_mask = model._prepare_decoder_attention_mask(
                 attention_mask, (batch_size, attention_mask.shape[1]), inputs_embeds, past_key_values_length, 
                 prefix_token_length=prefix_token_length
@@ -310,25 +240,11 @@ class LlamaDropMemoryModel(LlamaForCausalLM, BaseMemoryModel):
             past_key_value = past_key_values[idx] if past_key_values is not None else None
 
             if past_key_value is None:
-                if (self.half_layers and idx >= self.L // 2) or (not self.half_layers):
-                    if self.reuse_memory_for_every_layer:
-                        cur_idx = 0
-                    # elif self.half_layers:
-                    elif self.half_layers or (delta_memory is not None and delta_memory.shape[1] == self.L // 2):
-                        cur_idx = idx - self.L // 2
-                    else:
-                        cur_idx = idx
-                    hidden_states = self.cat_memory_and_hiddens(cur_idx,
-                                                    hidden_states=hidden_states,
-                                                    delta_memory=delta_memory,
-                                                    is_injection=is_injection,
-                                                    cat_memory_when_one_context=cat_memory_when_one_context)
-                else:
-                    if self.initialized and self.add_bos_embedding:
-                        hidden_states = torch.cat([self.bos_embedding[idx].unsqueeze(0).repeat(len(hidden_states), 1, 1), hidden_states], dim=1)
-
-                if hidden_states.shape[1] != position_ids.shape[1]:
-                    import ipdb; ipdb.set_trace()
+                hidden_states = self.cat_memory_and_hiddens(idx,
+                                                hidden_states=hidden_states,
+                                                delta_memory=delta_memory,
+                                                is_injection=is_injection,
+                                                cat_memory_when_one_context=cat_memory_when_one_context)
 
             if model.gradient_checkpointing and self.training:
 
@@ -366,74 +282,28 @@ class LlamaDropMemoryModel(LlamaForCausalLM, BaseMemoryModel):
                 
                 else:
 
-                    if self.add_pad_token:
-                        layer_outputs = decoder_layer(
-                            hidden_states,
-                            attention_mask=attention_mask,
-                            position_ids=position_ids,
-                            past_key_value=past_key_value,
-                            output_attentions=output_attentions,
-                            use_cache=use_cache,
-                            prefix_token_length=(self.num_tokens + 1 if self.add_bos_embedding else self.num_tokens) if past_key_value is None else 0,
-                        )
-
-                    else:
-
-                        # assert hidden_states.shape[0] == 1, "this implementation only supports batch size 1 when not using pad token"
-
-                        if output_delta_memory:
-                            if past_key_value is None and self.new_memory_embedding_fullset:
-                                # hidden_states[:, -self.num_tokens:] += self.new_memory_positional_emb(self.positional_indices.to(self.memory.device))
-                                if self.new_memory_positional_emb.device != hidden_states.device:
-                                    hidden_states[:, -self.num_tokens:] += self.new_memory_positional_emb.to(hidden_states.device)
-                                else:
-                                    hidden_states[:, -self.num_tokens:] += self.new_memory_positional_emb
-                            else:
-                                if self.memory_token_start_indication_embedding.device != hidden_states.device:
-                                    hidden_states[:, -self.num_tokens] += self.memory_token_start_indication_embedding.to(hidden_states.device)
-                                else:
-                                    hidden_states[:, -self.num_tokens] += self.memory_token_start_indication_embedding
-
-                        if self.half_layers and idx < self.L // 2:
-                            layer_outputs = decoder_layer(
-                                hidden_states,
-                                attention_mask=attention_mask_for_first_half,
-                                position_ids=position_ids_for_first_half,
-                                past_key_value=past_key_value,
-                                output_attentions=output_attentions,
-                                use_cache=use_cache,
-                            )
-
+                    if output_delta_memory:
+                        assert past_key_value is None
+                        if self.new_memory_positional_emb.device != hidden_states.device:
+                            hidden_states[:, -self.num_tokens:] += self.new_memory_positional_emb.to(hidden_states.device)
                         else:
-                            try:
-                                layer_outputs = decoder_layer(
-                                    hidden_states,
-                                    attention_mask=attention_mask,
-                                    position_ids=position_ids,
-                                    past_key_value=past_key_value,
-                                    output_attentions=output_attentions,
-                                    use_cache=use_cache,
-                                    prefix_token_length=prefix_token_length,
-                                    detach_indices=detach_indices,
-                                )
-                            except:
-                                import ipdb; ipdb.set_trace()
+                            hidden_states[:, -self.num_tokens:] += self.new_memory_positional_emb
+
+                    layer_outputs = decoder_layer(
+                        hidden_states,
+                        attention_mask=attention_mask,
+                        position_ids=position_ids,
+                        past_key_value=past_key_value,
+                        output_attentions=output_attentions,
+                        use_cache=use_cache,
+                        prefix_token_length=prefix_token_length,
+                        detach_indices=detach_indices,
+                    )
 
                 hidden_states = layer_outputs[0]
-                if output_delta_memory:
 
-                    if self.reuse_memory_for_every_layer:
-                        if idx == self.L - 1:
-                            all_delta_memory.append(hidden_states[:, -self.num_tokens:])
-                    elif self.half_layers:
-                        if idx >= self.L // 2:
-                            all_delta_memory.append(hidden_states[:, -self.num_tokens:])
-                    
-                    else:
-                        if self.additional_transformer:
-                            all_delta_memory.append(self.transformer_layer(hidden_states, prefix_token_length=hidden_states.shape[1] - self.num_tokens)[0])
-                        else:
-                            all_delta_memory.append(hidden_states[:, -self.num_tokens:])
+                if output_delta_memory:
+                    all_delta_memory.append(hidden_states[:, -self.num_tokens:])
                 
                 if not self.add_pad_token:
                     hidden_states = hidden_states[:, -input_ids.shape[1]:]
@@ -493,8 +363,7 @@ class LlamaDropMemoryModel(LlamaForCausalLM, BaseMemoryModel):
         
         return MemoryLMOutputWithPastAndCrossAttentions(
             loss=loss,
-            # logits=logits,
-            logits=delta_memory if is_injection else logits, # TODO: don't understand why only logits can serve as the pipe
+            logits=logits,
             last_hidden_state=hidden_states,
             past_key_values=next_cache,
             hidden_states=all_hidden_states,
