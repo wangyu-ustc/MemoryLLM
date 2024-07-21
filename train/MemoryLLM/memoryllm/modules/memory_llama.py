@@ -175,32 +175,29 @@ class LlamaDropMemoryModel(LlamaForCausalLM, BaseMemoryModel):
                     attention_mask = torch.cat([torch.ones([batch_size, 1]).long().to(model.device), attention_mask], dim=1)
 
             if self.initialized:
-                if self.add_pad_token:
-                    prefix_token_length = self.num_tokens + 1 if self.add_bos_embedding else self.num_tokens
+                if delta_memory is None:
+                    if is_injection:
+                        # prefix_token_length = input_ids.shape[1]
+                        prefix_token_length = min(input_ids.shape[1], self.num_tokens)
+                        
+                    else:
+                        prefix_token_length = self.memory.shape[1]
+                    prefix_token_length += 1 if self.add_bos_embedding else 0
                 else:
-                    if delta_memory is None:
-                        if is_injection:
-                            # prefix_token_length = input_ids.shape[1]
-                            prefix_token_length = min(input_ids.shape[1], self.num_tokens)
-                            
+                    if is_injection:
+                        
+                        # prefix_token_length = input_ids.shape[1] + delta_memory.shape[2] - self.num_tokens
+                        prefix_token_length = input_ids.shape[1] + delta_memory.shape[2] - max(self.num_tokens, input_ids.shape[1])
+
+                    else:
+                        if delta_memory.shape[2] == self.num_tokens:
+                            if cat_memory_when_one_context:
+                                prefix_token_length = self.memory.shape[1]
+                            else:
+                                prefix_token_length = delta_memory.shape[2]
                         else:
                             prefix_token_length = self.memory.shape[1]
-                        prefix_token_length += 1 if self.add_bos_embedding else 0
-                    else:
-                        if is_injection:
-                            
-                            # prefix_token_length = input_ids.shape[1] + delta_memory.shape[2] - self.num_tokens
-                            prefix_token_length = input_ids.shape[1] + delta_memory.shape[2] - max(self.num_tokens, input_ids.shape[1])
-
-                        else:
-                            if delta_memory.shape[2] == self.num_tokens:
-                                if cat_memory_when_one_context:
-                                    prefix_token_length = self.memory.shape[1]
-                                else:
-                                    prefix_token_length = delta_memory.shape[2]
-                            else:
-                                prefix_token_length = self.memory.shape[1]
-                        prefix_token_length += 1 if self.add_bos_embedding else 0
+                    prefix_token_length += 1 if self.add_bos_embedding else 0
 
             else:
                 prefix_token_length = 0
@@ -299,8 +296,7 @@ class LlamaDropMemoryModel(LlamaForCausalLM, BaseMemoryModel):
                 if output_delta_memory:
                     all_delta_memory.append(hidden_states[:, -self.num_tokens:])
                 
-                if not self.add_pad_token:
-                    hidden_states = hidden_states[:, -input_ids.shape[1]:]
+                hidden_states = hidden_states[:, -input_ids.shape[1]:]
             
             if use_cache:
                 next_decoder_cache += (layer_outputs[2 if output_attentions else 1],)

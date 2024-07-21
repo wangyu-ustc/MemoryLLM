@@ -28,9 +28,9 @@ model:
     num_contexts_schedule:
       checkpoints: [1000, 2500, 5000, 10000, 20000, 30000]
       values: [1, 2, 3, 4, 5, 10, 20]
-    validation_dataset_names:
-      - naturalqa
-      - squad
+    # validation_dataset_names:
+    #   - naturalqa
+    #   - squad
 
 data:
   target: main.DataModuleFromConfig
@@ -56,17 +56,17 @@ data:
         partition: head_middle
         # end_special_token: </s>
 
-    validation:
-      - target: MemoryLLM.memoryllm.data.nq.NQDataset
-        params:
-          filename: ./data/nq/v1.0-simplified_nq-dev-all.jsonl
-          num_unrelated_contexts: 5
-          num: 100
-      - target: MemoryLLM.memoryllm.data.squad.SQuADDataset
-        params:
-          filename: ./data/squad/dev-v2.0.json
-          num_unrelated_contexts: 5
-          num: 100
+    # validation:
+    #   - target: MemoryLLM.memoryllm.data.nq.NQDataset
+    #     params:
+    #       filename: ./data/nq/v1.0-simplified_nq-dev-all.jsonl
+    #       num_unrelated_contexts: 5
+    #       num: 100
+    #   - target: MemoryLLM.memoryllm.data.squad.SQuADDataset
+    #     params:
+    #       filename: ./data/squad/dev-v2.0.json
+    #       num_unrelated_contexts: 5
+    #       num: 100
 
 lightning:
   trainer:

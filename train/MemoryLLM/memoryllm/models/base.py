@@ -36,7 +36,6 @@ class BaseMemoryModelPL(pl.LightningModule):
                  occassionally_cat_memory_when_one_context_ratio=None,
                  detach_indices_when_one_context=False,
                  keep_gradient_for_the_last_step=False,
-                 random_drop_layer_ratio=None,
                  random_sample_length_ratio=1.0,
                  cache_data_for_longer_context=False,
                  remove_attention=False,
@@ -67,7 +66,6 @@ class BaseMemoryModelPL(pl.LightningModule):
         self.occassionally_cat_memory_when_one_context_ratio = occassionally_cat_memory_when_one_context_ratio
         self.related_position_when_validation = related_position_when_validation
         self.random_sample_length_ratio = random_sample_length_ratio
-        self.random_drop_layer_ratio = random_drop_layer_ratio
         self.remove_attention = remove_attention
         self.pass_ratio = pass_ratio
         self.warmup_delta_memory = warmup_delta_memory
@@ -280,7 +278,6 @@ class BaseMemoryModelPL(pl.LightningModule):
 
                 if len(contexts_ids) > 1:
 
-                    # all_delta_memory = []
                     all_delta_memory = None
                     delta_memory = None
 
@@ -426,7 +423,6 @@ class BaseMemoryModelPL(pl.LightningModule):
                 delta_memory=delta_memory,
                 output_delta_memory=False,
                 is_injection=False,
-                random_drop_layer_ratio=self.random_drop_layer_ratio,
                 return_dict=True, **additional_kwargs)
 
         loss = output['loss']

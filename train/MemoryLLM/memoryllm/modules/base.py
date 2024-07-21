@@ -115,10 +115,7 @@ class BaseMemoryModel(ABC):
                         [delta_memory[:, -((self.num_tokens * self.num_blocks) % delta_memory.shape[1]):]], dim=1
                     )
 
-            if self.put_memory_on_cpu:
-                self.memory.data = delta_memory.detach().cpu()
-            else:
-                self.memory.data = delta_memory
+            self.memory.data = delta_memory
 
         else:
 
@@ -126,34 +123,13 @@ class BaseMemoryModel(ABC):
 
                 current_memory = self.memory.data.detach() # detach might be unnecessary, but just to make sure
 
-                if len(self.exclude_layers) > 0:
-                    # Debug features
-                    for l_i in range(current_memory.shape[0]):
-                        if l_i not in self.exclude_layers:
-                            current_memory_layer_i = current_memory[l_i].unsqueeze(0)
-                            current_memory_layer_i = self.drop_memory(current_memory_layer_i)[0]
-                            self.memory.data[l_i] = torch.cat([current_memory_layer_i, delta_memory[l_i]], dim=0)
-
+                # current_memory.shape: [L, num_blocks * num_tokens, d]
+                # we need to drop 1/num_blocks current_memories on dimension 1:
+                current_memory = self.drop_memory(current_memory)
+                if current_memory.device != delta_memory.device:
+                    self.memory.data = torch.cat([current_memory, delta_memory.to(current_memory.device)], dim=1)
                 else:
-
-                    # current_memory.shape: [L, num_blocks * num_tokens, d]
-                    # we need to drop 1/num_blocks current_memories on dimension 1:
-                    current_memory = self.drop_memory(current_memory)
-                    if self.put_memory_on_cpu:
-                        self.memory.data = torch.cat([current_memory, delta_memory.detach().cpu()], dim=1)
-                    else:
-                        if current_memory.device != delta_memory.device:
-                            self.memory.data = torch.cat([current_memory, delta_memory.to(current_memory.device)], dim=1)
-                        else:
-                            try:
-                                self.memory.data = torch.cat([current_memory, delta_memory], dim=1)
-                            except:
-                                print('''
-                                RuntimeError: NVML_SUCCESS == DriverAPI::get()->nvmlInit_v2_() INTERNAL ASSERT FAILED at "../c10/cuda/CUDACachingAllocator.cpp":1123, please report a bug to PyTorch.
-                                      ''')
-                                self.memory.data = torch.cat([current_memory.cpu(), delta_memory.cpu()], dim=1)
-                    
-                    # assert self.memory.data.shape == (self.L, self.num_blocks * self.num_tokens, self.d)
+                    self.memory.data = torch.cat([current_memory, delta_memory], dim=1)
 
             else:
                 current_memory = self.memory.data.detach() # detach might be unnecessary, but just to make sure
@@ -242,41 +218,3 @@ class BaseMemoryModel(ABC):
                 cur_memory = torch.cat([self.bos_embedding[idx].unsqueeze(0).repeat(len(cur_memory), 1, 1), cur_memory], dim=1)
 
         return torch.cat([cur_memory, hidden_states], dim=1)
-
-
-    def customized_generate(
-        self, 
-        inputs_ids,
-        inputs_masks,
-        tokenizer,
-        max_new_tokens,
-        delta_memory=None,
-    ):
-
-        assert len(inputs_ids) == 1, "We currently only support generation with batch_size=1"
-
-        count = 0
-        while (not inputs_ids[0][-1].eq(tokenizer.eos_token_id)) and count < max_new_tokens:
-
-            model_outputs = self(
-                input_ids=inputs_ids,
-                attention_mask=inputs_masks,
-                delta_memory=delta_memory,
-                output_delta_memory=False,
-                return_dict=True
-            )
-
-            count += 1
-
-            new_id = model_outputs.logits[0][-1].argmax()
-
-            inputs_ids = torch.cat(
-                [inputs_ids,
-                torch.tensor([new_id]).unsqueeze(0).to(inputs_ids.device)], dim=-1
-            )
-            inputs_masks = torch.cat(
-                [inputs_masks,
-                torch.tensor([1]).unsqueeze(0).to(inputs_masks.device)], dim=-1
-            )
-
-        return inputs_ids
