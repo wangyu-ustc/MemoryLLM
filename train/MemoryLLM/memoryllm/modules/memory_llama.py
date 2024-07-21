@@ -94,13 +94,7 @@ class LlamaDropMemoryModel(LlamaForCausalLM, BaseMemoryModel):
 
         device = input_ids.device if input_ids is not None else inputs_embeds.device
         
-        if self.split_encoder_decoder:
-            if is_injection:
-                model = self.model
-            else:
-                model = self.decoder
-        else:
-            model = self.model
+        model = self.model
 
         if inputs_embeds is None:
             inputs_embeds = model.embed_tokens(input_ids)
