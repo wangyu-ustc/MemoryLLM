@@ -1,16 +1,35 @@
 # MemoryLLM: Towards Self-Updatable Large Language Models
 
-This is the official code for the paper: **MemoryLLM: Towards Self-Updatable Large Language Models**.   
-The model is open-sourced at https://huggingface.co/YuWangX/memoryllm-7b
+<p align="center" width="100%">
+<!-- put the image "memoryllm.png" -->
+<img src="memoryllm.png" width="80%" height="80%">
+</p>
 
-## Environment Setup
+## Official Links
+
+[![Static Badge](https://img.shields.io/badge/memoryllm-paper-green)](https://arxiv.org/abs/2402.04624)  
+
+[![MemoryLLM Checkpoint](https://img.shields.io/badge/memoryllm-checkpoints-blue)](https://huggingface.co/YuWangX/memoryllm-7b)
+
+<!-- This is the official code for the paper: **MemoryLLM: Towards Self-Updatable Large Language Models**.   
+The model is open-sourced at https://huggingface.co/YuWangX/memoryllm-7b -->
+
+## Release Notes
+- [2024/09] 🔥 Stronger model coming soon! 
+- [2024/06/21] 🔥 Training code is provided in the folder `train`.
+- [2024/06/02] 🔥 **MemoryLLM** checkpoint is [released](https://huggingface.co/YuWangX/memoryllm-7b)!
+- [2024/05/02] 🔥 **MemoryLLM** is accepted to ICML 2024!
+
+## Getting Started
+
+### Environment Setup
 ```
 conda create --name memoryllm
 conda activate memoryllm
 pip install -r requirements.txt
 ```
 
-## Load Model
+### Load Model
 First clone the repository and get into the repository: 
 ```
 git clone git@github.com:wangyu-ustc/MemoryLLM.git
@@ -26,7 +45,7 @@ model = MemoryLLM.from_pretrained("YuWangX/memoryllm-7b")
 tokenizer = LlamaTokenizer.from_pretrained("YuWangX/memoryllm-7b")
 ```
 
-## How to use the model
+### How to use the model
 Inject a piece of context into the model using the following script:
 ```
 model = model.cuda()
@@ -46,12 +65,12 @@ outputs = model.generate(inputs=input_ids.cuda(), attention_mask=attention_mask.
 print(tokenizer.decode(outputs[0]))
 ```
 
-## Evaluation
+### Evaluation
 
-### Model Editing Evaluations
+#### Model Editing Evaluations
 We put our reimplementation of various model-editing baselines and `MemoryLLM` in the repo [EditingLlama](https://github.com/wangyu-ustc/EditingLlama). 
 
-### Customized Experiments
+#### Customized Experiments
 To prepare the dataset, please download from [here](YuWangX/KnowledgeRetention). Please download the dataset and put them as the following structure: 
 ```
 - data
@@ -72,7 +91,7 @@ python test_qa_memory.py --model YuWangX/memoryllm-7b --nuc 10 --datasets natura
 ```
 here `nuc` means the the number of irrelevant contexts, and `naturalqa squad` means the datasets to evaluate the model on.
 
-### Evaluation on Longbench
+#### Evaluation on Longbench
 
 ```
 python longbench_pred.py --model memoryllm-7b --datasets hotpotqa --max_length 12384
@@ -81,14 +100,14 @@ Here `max_length` is the maximum length used when truncating the context.
 Then the generated results are all saved in the folder `longbench` for evaluation.
 
 
-## Training
+### Training
 In our implementations, we train Llama2-7B on C4 dataset. However, this may lead to the poor performance on the benchmark `qasper` (see Figure 4 in the [paper](https://arxiv.org/pdf/2402.04624)). Thus we put the script of training on red-pajama here, which is the dataset we have been using in the models we are currently exploring. 
 
 Please check the folder `train` using the following command:
 ```
 cd train
 ```
-### Dataset Preparation
+#### Dataset Preparation
 Please follow the instructions below to prepare the datasets: (make sure you have the datasets from [here](https://github.com/wangyu-ustc/MemoryLLM?tab=readme-ov-file#customized-experiments) prepared.)
 ```
 cd data
