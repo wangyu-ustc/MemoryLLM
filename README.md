@@ -9,13 +9,15 @@
 
 [![Static Badge](https://img.shields.io/badge/memoryllm-paper-green)](https://arxiv.org/abs/2402.04624)  
 
-[![MemoryLLM Checkpoint](https://img.shields.io/badge/memoryllm-checkpoints-blue)](https://huggingface.co/YuWangX/memoryllm-7b)
+[![MemoryLLM Checkpoint](https://img.shields.io/badge/memoryllm_7b-checkpoints-blue)](https://huggingface.co/YuWangX/memoryllm-7b)
+[![MemoryLLM Checkpoint](https://img.shields.io/badge/memoryllm_8b-checkpoints-blue)](https://huggingface.co/YuWangX/memoryllm-8b)
 
 <!-- This is the official code for the paper: **MemoryLLM: Towards Self-Updatable Large Language Models**.   
 The model is open-sourced at https://huggingface.co/YuWangX/memoryllm-7b -->
 
 ## Release Notes
-- [2024/09] 🔥 Stronger model coming soon! 
+- Chat model coming soon!
+- [2024/08/23] 🔥 We release [memoryllm-8b](https://huggingface.co/YuWangX/memoryllm-8b) with 1.67B memory equipped on Llama3! 
 - [2024/06/21] 🔥 Training code is provided in the folder `train`.
 - [2024/06/02] 🔥 **MemoryLLM** checkpoint is [released](https://huggingface.co/YuWangX/memoryllm-7b)!
 - [2024/05/02] 🔥 **MemoryLLM** is accepted to ICML 2024!
@@ -36,33 +38,33 @@ git clone git@github.com:wangyu-ustc/MemoryLLM.git
 cd MemoryLLM
 ```
 Then simply use the following code to load the model:
-```
+```python
 from modeling_memoryllm import MemoryLLM
 from configuration_memoryllm import MemoryLLMConfig
-from transformers import LlamaTokenizer
-config = MemoryLLMConfig.from_pretrained("YuWangX/memoryllm-7b")
-model = MemoryLLM.from_pretrained("YuWangX/memoryllm-7b")
-tokenizer = LlamaTokenizer.from_pretrained("YuWangX/memoryllm-7b")
+from transformers import AutoTokenizer
+
+# load pretrained model
+model = MemoryLLM.from_pretrained("YuWangX/memoryllm-8b")
+tokenizer = AutoTokenizer.from_pretrained("YuWangX/memoryllm-8b")
 ```
 
 ### How to use the model
 Inject a piece of context into the model using the following script:
-```
+```python
 model = model.cuda()
 
 # Self-Update with the new context
-context = "David likes eating apples."
-model.inject_memory(tokenizer(context, return_tensors='pt', add_special_tokens=False).input_ids.cuda(), update_memory=True)
+ctx = "Last week, John had a wonderful picnic with David. During their conversation, David mentioned multiple times that he likes eating apples. Though he didn't mention any other fruits, John says he can infer that David also like bananas."
 
-# Generation
-import torch
-input_ids = tokenizer("What fruits does David like? Answer:", return_tensors='pt', add_special_tokens=False).input_ids
-attention_mask = torch.cat([
-    torch.ones(input_ids.shape[0], model.num_tokens * model.num_blocks),
-    torch.ones_like(input_ids)
-], dim=1)
-outputs = model.generate(inputs=input_ids.cuda(), attention_mask=attention_mask.cuda(), max_new_tokens=10)
-print(tokenizer.decode(outputs[0]))
+# please make sure the context to inject into the memory is larger than 16 tokens, this is the hard minimum when training the model. The memory will be disturbed when less than 16 tokens are injected into the memory. 
+model.inject_memory(tokenizer(ctx, return_tensors='pt', add_special_tokens=False).input_ids.cuda(), update_memory=True)
+```
+
+For the pretrained model, use the following template:
+```python
+inputs = tokenizer("Question: What fruits does David like? Answer: David likes", return_tensors='pt', add_special_tokens=False).input_ids.cuda()
+outputs = model.generate(input_ids=inputs, max_new_tokens=20)
+response = tokenizer.decode(outputs[0][inputs.shape[1]:])
 ```
 
 ### Evaluation
