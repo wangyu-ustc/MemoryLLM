@@ -73,7 +73,7 @@ response = tokenizer.decode(outputs[0][inputs.shape[1]:])
 We put our reimplementation of various model-editing baselines and `MemoryLLM` in the repo [EditingLlama](https://github.com/wangyu-ustc/EditingLlama). 
 
 #### Customized Experiments
-To prepare the dataset, please download from [here](YuWangX/KnowledgeRetention). Please download the dataset and put them as the following structure: 
+To prepare the dataset, please download from [here](https://huggingface.co/datasets/YuWangX/KnowledgeRetention). Please download the dataset and put them as the following structure: 
 ```
 - data
   - squad
