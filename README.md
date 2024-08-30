@@ -51,6 +51,7 @@ tokenizer = AutoTokenizer.from_pretrained("YuWangX/memoryllm-8b")
 model = MemoryLLM.from_pretrained("YuWangX/memoryllm-8b-chat")
 tokenizer = AutoTokenizer.from_pretrained("YuWangX/memoryllm-8b-chat")
 ```
+If you want to use MemoryLLM-7B (the last version), please go to the branch `memoryllm-7b`. 
 
 ### How to use the model
 Inject a piece of context into the model using the following script:
