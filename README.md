@@ -11,12 +11,12 @@
 
 [![MemoryLLM Checkpoint](https://img.shields.io/badge/memoryllm_7b-checkpoints-blue)](https://huggingface.co/YuWangX/memoryllm-7b)
 [![MemoryLLM Checkpoint](https://img.shields.io/badge/memoryllm_8b-checkpoints-blue)](https://huggingface.co/YuWangX/memoryllm-8b)
-
+[![MemoryLLM Checkpoint](https://img.shields.io/badge/memoryllm_8b_chat-checkpoints-blue)](https://huggingface.co/YuWangX/memoryllm-8b-chat)
 <!-- This is the official code for the paper: **MemoryLLM: Towards Self-Updatable Large Language Models**.   
 The model is open-sourced at https://huggingface.co/YuWangX/memoryllm-7b -->
 
 ## Release Notes
-- Chat model coming soon!
+- [2024/08/30] 🔥 We release [memoryllm-8b-chat](https://huggingface.co/YuWangX/memoryllm-8b-chat), the chat model built on top of [memoryllm-8b](https://huggingface.co/YuWangX/memoryllm-8b).
 - [2024/08/23] 🔥 We release [memoryllm-8b](https://huggingface.co/YuWangX/memoryllm-8b) with 1.67B memory equipped on Llama3! 
 - [2024/06/21] 🔥 Training code is provided in the folder `train`.
 - [2024/06/02] 🔥 **MemoryLLM** checkpoint is [released](https://huggingface.co/YuWangX/memoryllm-7b)!
@@ -46,6 +46,10 @@ from transformers import AutoTokenizer
 # load pretrained model
 model = MemoryLLM.from_pretrained("YuWangX/memoryllm-8b")
 tokenizer = AutoTokenizer.from_pretrained("YuWangX/memoryllm-8b")
+
+# load chat model
+model = MemoryLLM.from_pretrained("YuWangX/memoryllm-8b-chat")
+tokenizer = AutoTokenizer.from_pretrained("YuWangX/memoryllm-8b-chat")
 ```
 
 ### How to use the model
@@ -58,6 +62,26 @@ ctx = "Last week, John had a wonderful picnic with David. During their conversat
 
 # please make sure the context to inject into the memory is larger than 16 tokens, this is the hard minimum when training the model. The memory will be disturbed when less than 16 tokens are injected into the memory. 
 model.inject_memory(tokenizer(ctx, return_tensors='pt', add_special_tokens=False).input_ids.cuda(), update_memory=True)
+```
+
+Then for chat model, use the following template: 
+```python
+# Generation
+messages = [{
+    'role': 'user', "content": "What fruits does David like?",
+}]
+
+inputs = tokenizer.apply_chat_template(messages, return_tensors="pt", add_generation_prompt=True)[:, 1:] # remove bos tokens as the model has its own trained bos embeddings.
+terminators = [
+    tokenizer.eos_token_id,
+    tokenizer.convert_tokens_to_ids("<|eot_id|>")
+]
+
+outputs = model.generate(input_ids=inputs.cuda(),
+                         max_new_tokens=20,
+                         eos_token_id=terminators)
+
+response = tokenizer.decode(outputs[0])
 ```
 
 For the pretrained model, use the following template:
