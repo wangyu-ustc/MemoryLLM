@@ -57,6 +57,7 @@ model = model.bfloat16()
 model.config._attn_implementation = 'flash_attention_2'
 model = model.cuda()
 ```
+If you want to use MemoryLLM-7B (the last version), please go to the branch `memoryllm-7b`. 
 
 ### How to use the model
 Inject a piece of context into the model using the following script:
