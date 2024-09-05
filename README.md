@@ -46,9 +46,9 @@ from transformers import AutoTokenizer
 # load pretrained model
 model = MemoryLLM.from_pretrained("YuWangX/memoryllm-8b")
 tokenizer = AutoTokenizer.from_pretrained("YuWangX/memoryllm-8b")
-model = model.cuda()
 model = model.bfloat16()
 model.config._attn_implementation = 'flash_attention_2'
+model = model.cuda()
 
 # load chat model
 model = MemoryLLM.from_pretrained("YuWangX/memoryllm-8b-chat")
