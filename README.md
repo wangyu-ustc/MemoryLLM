@@ -46,16 +46,21 @@ from transformers import AutoTokenizer
 # load pretrained model
 model = MemoryLLM.from_pretrained("YuWangX/memoryllm-8b")
 tokenizer = AutoTokenizer.from_pretrained("YuWangX/memoryllm-8b")
+model = model.cuda()
+model = model.bfloat16()
+model.config._attn_implementation = 'flash_attention_2'
 
 # load chat model
 model = MemoryLLM.from_pretrained("YuWangX/memoryllm-8b-chat")
 tokenizer = AutoTokenizer.from_pretrained("YuWangX/memoryllm-8b-chat")
+model = model.bfloat16()
+model.config._attn_implementation = 'flash_attention_2'
+model = model.cuda()
 ```
 
 ### How to use the model
 Inject a piece of context into the model using the following script:
 ```python
-model = model.cuda()
 
 # Self-Update with the new context
 ctx = "Last week, John had a wonderful picnic with David. During their conversation, David mentioned multiple times that he likes eating apples. Though he didn't mention any other fruits, John says he can infer that David also like bananas."
