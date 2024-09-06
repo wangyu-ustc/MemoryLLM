@@ -2,7 +2,7 @@
 
 <p align="center" width="100%">
 <!-- put the image "memoryllm.png" -->
-<img src="memoryllm.png" width="80%" height="80%">
+<img src="assets/memoryllm.png" width="80%" height="80%">
 </p>
 
 ## Official Links
@@ -131,6 +131,22 @@ python longbench_pred.py --model memoryllm-7b --datasets hotpotqa --max_length 1
 Here `max_length` is the maximum length used when truncating the context.
 Then the generated results are all saved in the folder `longbench` for evaluation.
 
+#### Evaluation results on MemoryLLM-8B
+Evaluation results on the knowledge-retention tasks are as follows: 
+<p align="center" width="100%">
+<!-- put the image "memoryllm.png" -->
+<img src="assets/nqa_comparison.png" width="100%" height="80%">
+</p>
+<p align="center" width="100%">
+<!-- put the image "memoryllm.png" -->
+<img src="assets/squad_comparison.png" width="100%" height="80%">
+</p>
+
+Evaluation results on LongBench are as follows:
+<p align="center" width="100%">
+<!-- put the image "memoryllm.png" -->
+<img src="assets/longbench.png" width="100%" height="80%">
+</p>
 
 ### Training
 In our implementations, we train Llama2-7B on C4 dataset. However, this may lead to the poor performance on the benchmark `qasper` (see Figure 4 in the [paper](https://arxiv.org/pdf/2402.04624)). Thus we put the script of training on red-pajama here, which is the dataset we have been using in the models we are currently exploring. 
