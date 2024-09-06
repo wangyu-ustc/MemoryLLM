@@ -132,7 +132,7 @@ Here `max_length` is the maximum length used when truncating the context.
 Then the generated results are all saved in the folder `longbench` for evaluation.
 
 #### Evaluation results on MemoryLLM-8B
-Evaluation results on the knowledge-retention tasks are as follows: 
+Evaluation results on the knowledge-retention tasks are as follows: (we updated the evaluation dataset by filtering out the examples whose questions can be answered by Llama3-8B. The new dataset is [here](https://huggingface.co/datasets/YuWangX/KnowledgeRetentionProcessed))
 <p align="center" width="100%">
 <!-- put the image "memoryllm.png" -->
 <img src="assets/nqa_comparison.png" width="100%" height="80%">
