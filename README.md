@@ -126,7 +126,7 @@ here `nuc` means the the number of irrelevant contexts, and `naturalqa squad` me
 #### Evaluation on Longbench
 
 ```
-python longbench_pred.py --model memoryllm-7b --datasets hotpotqa --max_length 12384
+python longbench_pred.py --model memoryllm-7b --datasets hotpotqa --max_length 16384
 ```
 Here `max_length` is the maximum length used when truncating the context.
 Then the generated results are all saved in the folder `longbench` for evaluation.
