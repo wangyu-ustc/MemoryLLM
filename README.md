@@ -45,16 +45,12 @@ from transformers import AutoTokenizer
 
 # load pretrained model
 model = MemoryLLM.from_pretrained("YuWangX/memoryllm-8b")
-tokenizer = AutoTokenizer.from_pretrained("YuWangX/memoryllm-8b")
-model = model.bfloat16()
-model.config._attn_implementation = 'flash_attention_2'
+tokenizer = AutoTokenizer.from_pretrained("YuWangX/memoryllm-8b", attn_implementation="flash_attention_2", torch_dtype=torch.float16)
 model = model.cuda()
 
 # load chat model
 model = MemoryLLM.from_pretrained("YuWangX/memoryllm-8b-chat")
-tokenizer = AutoTokenizer.from_pretrained("YuWangX/memoryllm-8b-chat")
-model = model.bfloat16()
-model.config._attn_implementation = 'flash_attention_2'
+tokenizer = AutoTokenizer.from_pretrained("YuWangX/memoryllm-8b-chat", attn_implementation="flash_attention_2", torch_dtype=torch.float16)
 model = model.cuda()
 ```
 If you want to use MemoryLLM-7B (the last version), please go to the branch `memoryllm-7b`. 
