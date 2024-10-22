@@ -66,7 +66,6 @@ class MemoryLMOutputWithPastAndCrossAttentions(CausalLMOutputWithCrossAttentions
         cross_attentions=None,
         delta_memory=None,
         last_hidden_state=None,
-        remaining_indices=None
     ):
         super().__init__(
             loss=loss,
@@ -77,7 +76,6 @@ class MemoryLMOutputWithPastAndCrossAttentions(CausalLMOutputWithCrossAttentions
             cross_attentions=cross_attentions,
         )
         self.delta_memory = delta_memory
-        self.remaining_indices = remaining_indices
         self.last_hidden_state = last_hidden_state
 
 
@@ -413,6 +411,7 @@ class LlamaFlashAttention2(LlamaAttention):
         output_attentions: bool = False,
         use_cache: bool = False,
         cache_position: Optional[torch.LongTensor] = None,
+        prefix_token_length: Optional[int] = 0,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
         if isinstance(past_key_value, StaticCache):
             raise ValueError(
@@ -423,20 +422,20 @@ class LlamaFlashAttention2(LlamaAttention):
         output_attentions = False
 
         bsz, q_len, _ = hidden_states.size()
-
-        query_states = self.q_proj(hidden_states)
+        
+        query_states = self.q_proj(hidden_states[:, prefix_token_length:])
         key_states = self.k_proj(hidden_states)
         value_states = self.v_proj(hidden_states)
 
         # Flash attention requires the input to have the shape
         # batch_size x seq_length x head_dim x hidden_dim
         # therefore we just need to keep the original shape
-        query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
+        query_states = query_states.view(bsz, q_len - prefix_token_length, self.num_heads, self.head_dim).transpose(1, 2)
         key_states = key_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
         value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
 
         cos, sin = self.rotary_emb(value_states, position_ids)
-        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, prefix_token_length=prefix_token_length)
 
         if past_key_value is not None:
             # sin and cos are specific to RoPE models; cache_position needed for the static cache
@@ -482,14 +481,15 @@ class LlamaFlashAttention2(LlamaAttention):
             key_states,
             value_states,
             attention_mask,
-            q_len,
+            q_len - prefix_token_length,
             dropout=dropout_rate,
             sliding_window=getattr(self, "sliding_window", None),
             use_top_left_mask=self._flash_attn_uses_top_left_mask,
             is_causal=self.is_causal,
         )
 
-        attn_output = attn_output.reshape(bsz, q_len, -1).contiguous()
+        attn_output = attn_output.reshape(bsz, q_len - prefix_token_length, -1).contiguous()
+
         attn_output = self.o_proj(attn_output)
 
         if not output_attentions:
@@ -516,7 +516,6 @@ class LlamaSdpaAttention(LlamaAttention):
         use_cache: bool = False,
         cache_position: Optional[torch.LongTensor] = None,
         prefix_token_length: Optional[int] = 0,
-        debug=False,
         **kwargs,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
         if output_attentions:
@@ -628,7 +627,6 @@ class LlamaDecoderLayer(nn.Module):
         use_cache: Optional[bool] = False,
         cache_position: Optional[torch.LongTensor] = None,
         prefix_token_length: Optional[int] = 0,
-        debug=False,
         **kwargs,
     ) -> Tuple[torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]]:
         """
@@ -664,7 +662,6 @@ class LlamaDecoderLayer(nn.Module):
             use_cache=use_cache,
             cache_position=cache_position,
             prefix_token_length=prefix_token_length,
-            debug=debug,
             **kwargs,
         )
         hidden_states = residual + hidden_states
@@ -1603,7 +1600,7 @@ class MemoryLLM(LlamaForCausalLM):
             
             return current_memory
 
-    def update_memory_with_delta_memory(self, delta_memory, remaining_indices=None):
+    def update_memory_with_delta_memory(self, delta_memory):
         
         if len(delta_memory.shape) == 4:
             delta_memory = delta_memory.detach()[0]
