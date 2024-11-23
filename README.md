@@ -117,7 +117,7 @@ We will evaluate our model on the validation set where the unrelated contexts ar
 mkdir results
 python test_qa_memory.py --model YuWangX/memoryllm-7b --nuc 10 --datasets naturalqa squad --num_samples 100
 ```
-here `nuc` means the the number of irrelevant contexts, and `naturalqa squad` means the datasets to evaluate the model on.
+here `nuc` means the number of irrelevant contexts, and `naturalqa squad` means the datasets to evaluate the model on.
 
 #### Evaluation on Longbench
 
