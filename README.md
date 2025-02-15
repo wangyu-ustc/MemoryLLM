@@ -1,4 +1,6 @@
-# MemoryLLM: Towards Self-Updatable Large Language Models
+# MemoryLLM & M+
+
+This is the official implementation of paper **MemoryLLM: Towards Self-Updatable Large Language Models** and **M+: Extending MemoryLLM with Scalable Long-Term Memory**.
 
 <p align="center" width="100%">
 <!-- put the image "memoryllm.png" -->
@@ -7,15 +9,21 @@
 
 ## Official Links
 
-[![Static Badge](https://img.shields.io/badge/memoryllm-paper-green)](https://arxiv.org/abs/2402.04624)  
+[![Static Badge](https://img.shields.io/badge/memoryllm-paper-green)](https://arxiv.org/abs/2402.04624)
+[![Static Badge](https://img.shields.io/badge/m+-paper-green)](https://arxiv.org/abs/2502.00592)  
+
 
 [![MemoryLLM Checkpoint](https://img.shields.io/badge/memoryllm_7b-checkpoints-blue)](https://huggingface.co/YuWangX/memoryllm-7b)
 [![MemoryLLM Checkpoint](https://img.shields.io/badge/memoryllm_8b-checkpoints-blue)](https://huggingface.co/YuWangX/memoryllm-8b)
 [![MemoryLLM Checkpoint](https://img.shields.io/badge/memoryllm_8b_chat-checkpoints-blue)](https://huggingface.co/YuWangX/memoryllm-8b-chat)
+[![MemoryLLM Checkpoint](https://img.shields.io/badge/mplus_8b-checkpoints-blue)](https://huggingface.co/YuWangX/mplus-8b)
+
 <!-- This is the official code for the paper: **MemoryLLM: Towards Self-Updatable Large Language Models**.   
 The model is open-sourced at https://huggingface.co/YuWangX/memoryllm-7b -->
 
 ## Release Notes
+- [2024/02/07] 🔥 The model `mplus-8b` has been uploaded to [mplus-8b](https://huggingface.co/YuWangX/mplus-8b).
+- [2024/02/01] 🔥 New paper [M+: Extending MemoryLLM with Scalable Long-Term Memory](https://arxiv.org/abs/2502.00592) is on Arxiv! 
 - [2024/08/30] 🔥 We release [memoryllm-8b-chat](https://huggingface.co/YuWangX/memoryllm-8b-chat), the chat model built on top of [memoryllm-8b](https://huggingface.co/YuWangX/memoryllm-8b).
 - [2024/08/23] 🔥 We release [memoryllm-8b](https://huggingface.co/YuWangX/memoryllm-8b) with 1.67B memory equipped on Llama3! 
 - [2024/06/21] 🔥 Training code is provided in the folder `train`.
@@ -37,19 +45,31 @@ First clone the repository and get into the repository:
 git clone git@github.com:wangyu-ustc/MemoryLLM.git
 cd MemoryLLM
 ```
-Then simply use the following code to load the model:
+
+Then to load `MPlus-8B`, please use the following code: 
 ```python
 import torch
-from modeling_memoryllm import MemoryLLM
 from transformers import AutoTokenizer
+from modeling_mplus import MPlus
 
+# load the model mplus-8b (currently we only have the pretrained version)
+model = MPlus.from_pretrained("YuWangX/mplus-8b", attn_implementation="flash_attention_2", torch_dtype=torch.bfloat16)
+tokenizer = AutoTokenizer.from_pretrained("YuWangX/mplus-8b")
+model = model.to(torch.bfloat16) # need to call it again to cast the `inv_freq` in rotary_emb to bfloat16 as well
+model.put_ltm_to_numpy() # We include ltm as modules so that it can be uploaded to huggingface, but for inference we need to put ltm on CPU and cast ltm_ags to numpy. 
+model = model.cuda()
+# After this, the usage of MPlus is the same as MemoryLLM-8B, please check "How to use the model" below. 
+```
+
+To load `MemoryLLM-8B` and `MemoryLLM-8B-chat`, please use the following code:
+```python
 # load pretrained model
-model = MemoryLLM.from_pretrained("YuWangX/memoryllm-8b", attn_implementation="flash_attention_2", torch_dtype=torch.float16)
+model = MemoryLLM.from_pretrained("YuWangX/memoryllm-8b", attn_implementation="flash_attention_2", torch_dtype=torch.bfloat16)
 tokenizer = AutoTokenizer.from_pretrained("YuWangX/memoryllm-8b")
 model = model.cuda()
 
 # load chat model
-model = MemoryLLM.from_pretrained("YuWangX/memoryllm-8b-chat", attn_implementation="flash_attention_2", torch_dtype=torch.float16)
+model = MemoryLLM.from_pretrained("YuWangX/memoryllm-8b-chat", attn_implementation="flash_attention_2", torch_dtype=torch.bfloat16)
 tokenizer = AutoTokenizer.from_pretrained("YuWangX/memoryllm-8b-chat")
 model = model.cuda()
 ```
@@ -177,13 +197,37 @@ python main.py -t --base MemoryLLM/configs/openllama/openllama_4x256.yaml
 ## Citations
 If you find this repo helpful, please consider cite our paper:
 ```
-@misc{memoryllm,
-      title={MEMORYLLM: Towards Self-Updatable Large Language Models}, 
-      author={Yu Wang and Yifan Gao and Xiusi Chen and Haoming Jiang and Shiyang Li and Jingfeng Yang and Qingyu Yin and Zheng Li and Xian Li and Bing Yin and Jingbo Shang and Julian McAuley},
-      year={2024},
-      eprint={2402.04624},
+@inproceedings{memoryllm,
+  author       = {Yu Wang and
+                  Yifan Gao and
+                  Xiusi Chen and
+                  Haoming Jiang and
+                  Shiyang Li and
+                  Jingfeng Yang and
+                  Qingyu Yin and
+                  Zheng Li and
+                  Xian Li and
+                  Bing Yin and
+                  Jingbo Shang and
+                  Julian J. McAuley},
+  title        = {{MEMORYLLM:} Towards Self-Updatable Large Language Models},
+  booktitle    = {Forty-first International Conference on Machine Learning, {ICML} 2024,
+                  Vienna, Austria, July 21-27, 2024},
+  publisher    = {OpenReview.net},
+  year         = {2024},
+  url          = {https://openreview.net/forum?id=p0lKWzdikQ},
+  timestamp    = {Fri, 06 Dec 2024 12:46:25 +0100},
+  biburl       = {https://dblp.org/rec/conf/icml/WangGCJLYYLLYSM24.bib},
+  bibsource    = {dblp computer science bibliography, https://dblp.org}
+}
+
+@misc{wang2025mextendingmemoryllmscalable,
+      title={M+: Extending MemoryLLM with Scalable Long-Term Memory}, 
+      author={Yu Wang and Dmitry Krotov and Yuanzhe Hu and Yifan Gao and Wangchunshu Zhou and Julian McAuley and Dan Gutfreund and Rogerio Feris and Zexue He},
+      year={2025},
+      eprint={2502.00592},
       archivePrefix={arXiv},
       primaryClass={cs.CL},
-      url={https://arxiv.org/abs/2402.04624}, 
+      url={https://arxiv.org/abs/2502.00592}, 
 }
 ```
