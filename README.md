@@ -39,6 +39,8 @@ conda activate memoryllm
 pip install -r requirements.txt
 ```
 
+**Note:** In most cases, directly using `requirements.txt` should work well. However, if you encounter any compatibility issues, you can use `requirements_newest.txt` which contains locked versions that have been personally tested and verified to work. The testing environment used CUDA version 12.2 with H100-80GB-HBM3 GPUs.
+
 ### Load Model
 First clone the repository and get into the repository: 
 ```
@@ -63,6 +65,10 @@ model = model.cuda()
 
 To load `MemoryLLM-8B` and `MemoryLLM-8B-chat`, please use the following code:
 ```python
+import torch
+from transformers import AutoTokenizer
+from modeling_memoryllm import MemoryLLM
+
 # load pretrained model
 model = MemoryLLM.from_pretrained("YuWangX/memoryllm-8b", attn_implementation="flash_attention_2", torch_dtype=torch.bfloat16)
 tokenizer = AutoTokenizer.from_pretrained("YuWangX/memoryllm-8b")
