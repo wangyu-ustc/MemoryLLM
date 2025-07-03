@@ -39,7 +39,7 @@ conda activate memoryllm
 pip install -r requirements.txt
 ```
 
-**Note:** In most cases, directly using `requirements.txt` should work well. However, if you encounter any compatibility issues, you can use `requirements_newest.txt` which contains locked versions that have been personally tested and verified to work. The testing environment used CUDA version 12.2 with H100-80GB-HBM3 GPUs.
+**Note:** In most cases, directly using `requirements.txt` should work well. However, if you encounter any compatibility issues, you can use `requirements_infer_only.txt` which contains locked versions that have been personally tested and verified to work. The testing environment used CUDA version 12.2 with H100-80GB-HBM3 GPUs.
 
 ### Load Model
 First clone the repository and get into the repository: 
