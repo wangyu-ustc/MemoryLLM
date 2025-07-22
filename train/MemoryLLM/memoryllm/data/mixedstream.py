@@ -4,8 +4,9 @@ import torch
 import gzip
 import random
 import numpy as np
+from datasets import load_dataset
+from transformers import AutoTokenizer
 from torch.utils.data import IterableDataset
-
 
 def split_sequence(seq_length, min_length, max_length):
 
@@ -48,10 +49,12 @@ def split_sequence(seq_length, min_length, max_length):
 
     return chunks
 
-class RedPajamaDataset(IterableDataset):
-    def __init__(self, split=None, 
-                 root="./data/redpajama", 
-                 tokenizer='gpt2', 
+class MixedStreamDataset(IterableDataset):
+    def __init__(self, 
+                 root="HuggingFaceFW/fineweb-edu", 
+                 name="CC-MAIN-2024-10", 
+                 longdoc_root='./local_data/long_data/',
+                 split="train",
                  tokenizer_path=None,
                  min_length=256,
                  max_length=768,
@@ -59,44 +62,34 @@ class RedPajamaDataset(IterableDataset):
                  max_seq_length=None,
                  end_special_token="",
                  add_special_tokens=False,
-                 languages=['en'],
-                 snapshots=["2023-14", "2023-06", "2022-49", "2022-40"], # 327600208 examples in snapshot 2023-14
-                 partition='head_middle',
-                 shuffle=True,
                  target_is_context=False,
                  shuffle_first_context=False,
                  overlap_contexts=False,
                  negative_contexts_ratio=0.0,
                  overlap_contexts_ratio=0.0,
                  target_is_context_ratio=0.0,
-                #  instruction="Repeat:",
                  repeat_with_unrelated=False,
                  max_unrelated_at_one_step=20,
                  force_num_of_contexts=None,
-                 reverse=False,
-                 seed=None,
+                 long_documents_ratios={
+                     '4k-8k': 0.3,
+                     '8k-16k': 0.2,
+                     '16k-32k': 0.2,
+                     '32k-64k': 0.1
+                 },
+                 short_document_start=0,
+                 short_document_end=None,
                  ):
-        '''
-        split: ['sentence', 'random']
-        '''
+        
         self.root = root
-        self.snapshots = snapshots
-        self.partition = partition
-        self.languages = languages
+        self.longdoc_root = longdoc_root
         self.max_length = max_length
         self.min_length = min_length
         self.num_tokens = num_tokens
         self.end_special_token = end_special_token
         self.add_special_tokens = add_special_tokens
         self.max_seq_length = max_seq_length if max_seq_length is not None else max_length
-        if tokenizer == 'gpt2':
-            from transformers import GPT2Tokenizer
-            self.tokenizer = GPT2Tokenizer.from_pretrained('gpt2')
-        elif tokenizer == 'llama':
-            from transformers import AutoTokenizer
-            self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
-        else:
-            self.tokenizer = tokenizer
+        self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
         self.target_is_context = target_is_context
         self.shuffle_first_context = shuffle_first_context
         self.overlap_contexts = overlap_contexts
@@ -113,33 +106,97 @@ class RedPajamaDataset(IterableDataset):
 
         assert not (self.target_is_context_ratio > 0 and self.target_is_context), "you cannot set target_is_context_ratio > 0 and target_is_context=True at the same time!"
 
-        all_paths = []
+        self.ds = load_dataset(root, name=name, split=split, trust_remote_code=True)
+         # select the examples from 50000 to the last
+        self.ds = self.ds.select(range(50000, len(self.ds)))
+        short_document_end = short_document_end if short_document_end is not None else len(self.ds)
+        self.ds = self.ds.select(range(short_document_start, short_document_end))
+        self.short_document_length = len(self.ds)
 
-        for snapshot in self.snapshots:
+        # shuffle self.ds
+        self.ds = self.ds.shuffle(seed=42)
 
-            for language in self.languages:
+        # Calculate the number of long documents needed for each category
+        self.long_documents_ratios = long_documents_ratios
+        total_long_ratio = sum(long_documents_ratios.values())
+        self.total_length = len(self.ds) / (1 - total_long_ratio)
+
+        self.long_documents_counts = {
+            key: int(self.total_length * ratio) for key, ratio in long_documents_ratios.items()
+        }
+        self.total_length = self.short_document_length + sum(self.long_documents_counts.values())
+
+        # TODO: check if the length of long documents surpasss the existing long documents
+
+        self.key2chunk = {}
+        # set the order of documents
+        keys = ['short'] * self.short_document_length
+        for key, count in self.long_documents_counts.items():
+            keys += [key] * count
+            # determine how many chunks to use
+            num_chunks = int(np.ceil(count / 1000))
+            self.key2chunk[key] = [str(i) for i in range(num_chunks)]
+        
+        # shuffle the keys
+        random.shuffle(keys)
+        self.keys = keys
+
+        self.key2count = {key: 0 for key in ['short'] + list(self.long_documents_counts.keys())}
+        self.key2chunkid = {key: 0 for key in self.long_documents_counts}
+        self.key2doc = {key:[] for key in self.long_documents_counts}
+
+    def set_worker(self, worker_id, num_workers):
+        # reset the keys
+        
+        # select the examples from self.ds
+        
+        print("worker_id:", worker_id, "short select from:", (len(self.ds) // num_workers) * worker_id, (len(self.ds) // num_workers) * (worker_id + 1))
+        self.ds = self.ds.select(range((len(self.ds) // num_workers) * worker_id, (len(self.ds) // num_workers) * (worker_id + 1)))
+
+        # select the chunk from self.key2chunk
+        for key in self.key2chunk:
+            chunks = self.key2chunk[key]
+            total_chunks = len(chunks)
+            self.key2chunk[key] = chunks[(total_chunks // num_workers) * worker_id: (total_chunks // num_workers) * (worker_id + 1)]
+
+        # reset self.keys
+        keys = ['short'] * len(self.ds)
+        for key, chunks in self.key2chunk.items():
+            keys += [key] * (len(chunks) * 1000)
+        random.shuffle(keys)
+
+        print("worker_id:", worker_id)
+        print("key2chunk:", self.key2chunk)
+    
+    def __iter__(self):
+
+        for key in self.keys:
+
+            if key == "short":
+                doc = self.ds[self.key2count[key]]['text']
+            else:            
+                if self.key2count[key] >= len(self.key2doc[key]):
+                    with open(os.path.join(self.longdoc_root, f"{key}/chunk_{self.key2chunk[key][self.key2chunkid[key]]}.jsonl"), "r") as f:
+                        lines = f.readlines()
+                        lines = [json.loads(line)['text'] for line in lines]
+                    self.key2doc[key] = lines
+                    self.key2count[key] = 0
+                    self.key2chunkid[key] += 1
                 
-                # load all paths from txt file f"{language}-{snapshot}-{self.partition}.txt"
-                with open(f"{self.root}/listings/{language}-{snapshot}-{self.partition}.txt", "r") as f:
-                    paths = f.readlines()
+                doc = self.key2doc[key][self.key2count[key]]
+            
+            self.key2count[key] += 1
+            
+            if self.target_is_context or random.random() < self.target_is_context_ratio:
+                output = self.get_repeat_context_sentence(doc)
+            else:
+                output = self.get_context_and_sentence(doc)
+            
+            if output is None:
+                continue
                 
-                paths = [path.strip() for path in paths]
-
-                all_paths.extend(paths)
-
-        if shuffle:
-            if seed is not None:
-                random.seed(seed)
-            # permute the paths:
-            random.shuffle(all_paths)
-
-        if reverse:
-            # "[::-1]" is a debugging feature
-            self.all_paths = all_paths[::-1]
-        else:
-            self.all_paths = all_paths
-
-        # take a pass over all the data to get the meta information
+            contexts, sentence, label = output
+            yield contexts, sentence, label
 
     def get_context_and_sentence(self, doc, return_doc=False):
         
@@ -232,103 +289,53 @@ class RedPajamaDataset(IterableDataset):
             
             return contexts, sentence, 4
 
-    def __iter__(self):
-
-        for path in self.all_paths:
-
-            if not os.path.exists(f"{self.root}/documents/{path}.json.gz"):
-                continue
-
-            with gzip.open(f"{self.root}/documents/{path}.json.gz") as f:
-                for line in f:
-                    data = json.loads(line)
-                    doc = data['raw_content']
-
-                    if self.target_is_context or random.random() < self.target_is_context_ratio:
-                        output = self.get_repeat_context_sentence(doc)
-                        if output is None:
-                            continue
-                        contexts, sentence, label = output
-
-                        if self.force_num_of_contexts is not None:
-                            if len(contexts) < self.force_num_of_contexts:
-                                continue
-                            else:
-                                contexts = contexts[:self.force_num_of_contexts]
-
-                        yield contexts, sentence, label
-
-                    else:
-
-                        output = self.get_context_and_sentence(doc)
-                        if output is not None:
-                            contexts, sentence, label = output
-                            yield contexts, sentence, label
 
 if __name__ == '__main__':
 
     def worker_init_fn(worker_id):
+
         worker_info = torch.utils.data.get_worker_info()
         dataset = worker_info.dataset # the dataset copy in this worker process
-        all_dataset = len(dataset.all_paths)
-        per_worker = all_dataset // worker_info.num_workers
-        dataset.all_paths = dataset.all_paths[worker_id * per_worker: (worker_id + 1) * per_worker]
+        dataset.set_worker(worker_id, worker_info.num_workers)
 
-    dataset = RedPajamaDataset(root="../../../data/redpajama", 
-                               snapshots=['2023-14'],
-                               end_special_token='</s>',
-                               tokenizer='llama',
-                               tokenizer_path='openlm-research/open_llama_3b_v2',
-                               target_is_context=True)
+        # all_dataset = len(dataset.all_paths)
+        # per_worker = all_dataset // worker_info.num_workers
+        # dataset.all_paths = dataset.all_paths[worker_id * per_worker: (worker_id + 1) * per_worker]
+    
+    dataset = MixedStreamDataset(longdoc_root='../../../local_data/long_data/',
+                                 tokenizer_path="meta-llama/Meta-Llama-3.1-8B",
+                                max_length=512,
+                                min_length=16,
+                                max_seq_length=2048,
+                                add_special_tokens=False,
+                                long_documents_ratios={
+                                    '4k-8k': 0.2,
+                                    '8k-16k': 0.2,
+                                    '16k-32k': 0.2,
+                                    '32k-64k': 0.2
+                                },
+                                short_document_end=200000,
+                                short_document_start=0,)
+    
+    # for i, (contexts, sentence, label) in enumerate(dataset):
+    #     print(i, contexts, sentence, label)
+    #     if i == 10:
+    #         break
+    # for i, doc in enumerate(dataset):
+    #     print(i, doc)
+    #     if i == 10:
+    #         break
 
-    # count = 0
+    from torch.utils.data import DataLoader
 
-    # for path in dataset.all_paths:
+    dataloader = DataLoader(dataset, batch_size=1, num_workers=8, worker_init_fn=worker_init_fn)    
 
-    #     if not os.path.exists(f"{dataset.root}/documents/{path}.json.gz"):
-    #         continue
+    for idx, batch in enumerate(dataloader):
+        # pass
+        print(batch)
+        # break
 
-    #     with gzip.open(f"{dataset.root}/documents/{path}.json.gz") as f:
-    #         for line in f:
-    #             # data = json.loads(line)
-    #             # doc = data['raw_content']
+        # import ipdb; ipdb.set_trace()
 
-    #             count += 1
-    #             if count % 100000 == 0:
-    #                 print(count)
-
-    # print("Total Number:", count)
-
-    # dataset_iter = iter(dataset)
-    # contexts, contexts_masks, sentence, sentence_mask, label = next(dataset_iter)
-
-    # import ipdb; ipdb.set_trace()
-
-    import time
-
-    count = 1000
-
-    dataloader = torch.utils.data.DataLoader(dataset, batch_size=1, num_workers=1)
-
-    start = time.time()
-    for i, data in enumerate(dataset):
-        if i > count:
-            break
-    end = time.time()
-    print("Time taken: ", end - start)
-
-    dataloader = torch.utils.data.DataLoader(dataset, batch_size=1, num_workers=2, worker_init_fn=worker_init_fn)
-    start = time.time()
-    for i, data in enumerate(dataloader):
-        if i > count:
-            break
-    end = time.time()
-    print("Time taken: ", end - start)
-
-    dataloader = torch.utils.data.DataLoader(dataset, batch_size=1, num_workers=4, worker_init_fn=worker_init_fn)
-    start = time.time()
-    for i, data in enumerate(dataloader):
-        if i > count:
-            break
-    end = time.time()
-    print("Time taken: ", end - start)
+        if idx % 10 == 0:
+            import ipdb; ipdb.set_trace()

@@ -1,0 +1,167 @@
+model:
+  base_learning_rate: 4.6e-6
+  target: MemoryLLM.memoryllm.models.memory.LlamaMemoryModelPL
+  params:
+    monitor: val/total_loss
+    num_blocks: 50
+    num_tokens: 256
+    update_memory_during_training: true
+    max_seq_length: 2048
+    lora_config:
+      inference_mode: false
+      r: 16
+      lora_alpha: 32
+      lora_dropout: 0.1
+      target_modules: ['q_proj', 'v_proj', 'k_proj', 'up_proj', 'down_proj', 'gate_proj']
+    module_name: LlamaDropMemoryModel
+    model_path: meta-llama/Meta-Llama-3.1-8B
+    add_decoder_lora: true
+    add_bos_embedding: true
+    cat_and_drop_memory: true
+    cache_data_for_longer_context: true
+    new_memory_embedding_fullset: true
+    shrink_to_one_embedding: true
+    occassionally_cat_to_maximum_memory_ratio: 0.8
+    keep_gradient_for_the_last_step: false
+    attn_implementation: flash_attention_2
+    drop_memory_per_layer: true
+    full_context_and_sentence_training_ratio: 0.05
+    instruct: "Repeat:"
+    # half_last: true # if set to true, the process may be freezed somehow
+    gradient_checkpointing: false
+    mask_instruction_tokens: true
+    num_of_additional_tokens_to_mask: 5
+    num_contexts_schedule:
+      checkpoints: [100000, 200000]
+      values: [50, 100, 200]
+    random_sample_length_ratio: 0.0
+    pass_ratio: 0.8
+    empty_prob: 1.0
+    validation_dataset_names:
+      - naturalqa
+      - squad
+      # pretraining dataset
+      - slimpajama
+      - fineweb
+      # - slimlong
+      # long context qa
+      - narrativeqa
+      - 2wikimqa
+      - hotpotqa
+      - qasper
+      - musique
+      - multifieldqa_en
+    ckpt_path: ./logs/2024-10-20T14-35-22_llama3.1_50x256_long/checkpoints/step=000022500.ckpt
+
+data:
+  target: main.DataModuleFromConfig
+  params:
+    batch_size: 1
+    eval_batch_size: 1
+    eval_max_length: 462
+    num_workers: 8
+    num_tokens: 256
+    wrap: False
+    use_worker_init_fn: true
+    worker_init_fn: worker_init_fn_mixed
+    train:
+      target: MemoryLLM.memoryllm.data.mixedstream.MixedStreamDataset
+      params:
+        root: HuggingFaceFW/fineweb-edu
+        longdoc_root: ./local_data/long_data/
+        name: CC-MAIN-2024-10
+        split: train
+        tokenizer_path: meta-llama/Meta-Llama-3.1-8B
+        max_length: 512
+        min_length: 16
+        max_seq_length: 2048
+        add_special_tokens: false
+        target_is_context_ratio: 0.1
+        long_documents_ratios:
+          4k-8k: 0.2
+          8k-16k: 0.2
+          16k-32k: 0.2
+          32k-64k: 0.2
+        short_document_start: 0
+        short_document_end: 200000
+
+    validation:
+      - target: MemoryLLM.memoryllm.data.cqa.CQADataset
+        params:
+          root: ./local_data/nqa
+          num_unrelated_contexts: 120
+          num: 100
+      - target: MemoryLLM.memoryllm.data.cqa.CQADataset
+        params:
+          root: ./local_data/squad
+          num_unrelated_contexts: 120
+          num: 100
+      - target: MemoryLLM.memoryllm.data.slimpajama.SlimPajamaValDataset
+        params:
+          root: DKYoon/SlimPajama-6B
+          tokenizer_path: meta-llama/Meta-Llama-3.1-8B
+          split: validation
+          max_seq_length: 2048
+      - target: MemoryLLM.memoryllm.data.fineweb.FineWebEduValDataset
+        params:
+          root: HuggingFaceFW/fineweb-edu
+          name: CC-MAIN-2024-10
+          tokenizer_path: meta-llama/Meta-Llama-3.1-8B
+          max_seq_length: 2048
+          num: 10000
+      # - target: MemoryLLM.memoryllm.data.slimlong.SlimLongDataset
+      #   params:
+      #     num: 500
+      #     tokenizer_path: meta-llama/Meta-Llama-3.1-8B
+      - target: MemoryLLM.memoryllm.data.longcontext.LongContextDataset
+        params:
+          dataset: narrativeqa
+          tokenizer_path: meta-llama/Meta-Llama-3.1-8B
+          max_length: 8192
+          prompt_format_path: longbench_config/dataset2prompt_mem.json
+          maxlen_path: longbench_config/dataset2maxlen.json
+      - target: MemoryLLM.memoryllm.data.longcontext.LongContextDataset
+        params:
+          dataset: 2wikimqa
+          tokenizer_path: meta-llama/Meta-Llama-3.1-8B
+          max_length: 8192
+          prompt_format_path: longbench_config/dataset2prompt_mem.json
+          maxlen_path: longbench_config/dataset2maxlen.json
+      - target: MemoryLLM.memoryllm.data.longcontext.LongContextDataset
+        params:
+          dataset: hotpotqa
+          tokenizer_path: meta-llama/Meta-Llama-3.1-8B
+          max_length: 8192
+          prompt_format_path: longbench_config/dataset2prompt_mem.json
+          maxlen_path: longbench_config/dataset2maxlen.json
+      - target: MemoryLLM.memoryllm.data.longcontext.LongContextDataset
+        params:
+          dataset: qasper
+          tokenizer_path: meta-llama/Meta-Llama-3.1-8B
+          max_length: 8192
+          prompt_format_path: longbench_config/dataset2prompt_mem.json
+          maxlen_path: longbench_config/dataset2maxlen.json
+      - target: MemoryLLM.memoryllm.data.longcontext.LongContextDataset
+        params:
+          dataset: musique
+          tokenizer_path: meta-llama/Meta-Llama-3.1-8B
+          max_length: 8192
+          prompt_format_path: longbench_config/dataset2prompt_mem.json
+          maxlen_path: longbench_config/dataset2maxlen.json
+      - target: MemoryLLM.memoryllm.data.longcontext.LongContextDataset
+        params:
+          dataset: multifieldqa_en
+          tokenizer_path: meta-llama/Meta-Llama-3.1-8B
+          max_length: 8192
+          prompt_format_path: longbench_config/dataset2prompt_mem.json
+          maxlen_path: longbench_config/dataset2maxlen.json
+
+lightning:
+  trainer:
+    accelerator: gpu
+    strategy: deepspeed_stage_2
+    # limit_train_batches: 10000 # this is lethal, as it will limit 10000 batches and only train on that 10000 batches over and over again
+    # every_n_train_steps: 10
+    precision: 16-mixed
+    val_check_interval: 10000
+    # accumulate_grad_batches: 4

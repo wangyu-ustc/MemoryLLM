@@ -1,3 +1,6 @@
+import os
+import re
+import string
 import importlib
 
 import torch
@@ -5,6 +8,7 @@ import numpy as np
 from collections import abc
 from einops import rearrange
 from functools import partial
+from collections import Counter
 
 import multiprocessing as mp
 from threading import Thread
@@ -12,6 +16,7 @@ from queue import Queue
 import random 
 
 from inspect import isfunction
+from metrics import qa_f1_score
 from pytorch_lightning.callbacks import ModelCheckpoint
 
 
@@ -151,11 +156,21 @@ def parallel_data_prefetch(
         return gather_res
 
 
-
 class ModelCheckpointLLM(ModelCheckpoint):
     
     def _save_checkpoint(self, trainer, filepath):
-        trainer.model.model.save_pretrained(filepath)
+        weights = {}
+        for name, param in trainer.model.module.named_parameters():
+            if param.requires_grad or "memory" in name or "lora" in name:
+                weights[name] = param.data
+        
+        torch.save(weights, filepath.replace("epoch=", "lora_epoch="))
+
+        # save the long term memory, only save the latest ltm
+        if hasattr(trainer.model.module.model, "ltm"):
+            torch.save(trainer.model.module.model.ltm, os.path.join(os.path.dirname(filepath), "ltm.pt"))
+            # Save multiple arrays into a single .npz file
+            np.savez(os.path.join(os.path.dirname(filepath), 'ltm_recall_frequency.npz'), *trainer.model.module.model.ltm_recall_frequencies)
 
 def select_mask_span(total_length, remaining_mask_count, max_span_length=20):
     start = random.randint(0, total_length - 1)  # random starting point
@@ -224,81 +239,6 @@ def mask_tokens(context_ids, contexts_attention_mask, mask_strategy, mask_ratio,
 
     return context_ids, contexts_attention_mask
 
-# def collate_fn(data, tokenizer, max_length, num_tokens, 
-#                     add_special_tokens=False, 
-#                     end_special_token=None, 
-#                     mask_strategy='word', 
-#                     mask_ratio=0.0,
-#                     padding='longest'):
-
-#     data = list(zip(*data))
-
-#     if len(data) == 4:
-#         contexts, sentences, target_is_context_indicator, labels = data
-#         unrelated_contexts = None
-
-#     else:
-#         unrelated_contexts, contexts, sentences, target_is_context_indicator, labels = data
-
-#     target_is_context_indicator = torch.tensor(target_is_context_indicator)
-
-#     if end_special_token is not None:
-#         sentences = [x + end_special_token for x in list(sentences)]
-    
-#     contexts_tokenized = tokenizer(list(contexts), 
-#                                    max_length=max_length, 
-#                                    padding=padding,
-#                                    truncation=True, 
-#                                    return_tensors='pt',
-#                                    add_special_tokens=add_special_tokens)
-
-#     if unrelated_contexts is not None:
-#         unrelated_contexts_tokenized = tokenizer(list(unrelated_contexts), 
-#                                    max_length=max_length, 
-#                                    padding=padding,
-#                                    truncation=True, 
-#                                    return_tensors='pt',
-#                                    add_special_tokens=add_special_tokens)
-
-#     sentences_tokenized = tokenizer(list(sentences), 
-#                                     max_length=max_length, 
-#                                     truncation=True, 
-#                                     padding='longest',
-#                                     return_tensors='pt',
-#                                     add_special_tokens=add_special_tokens)
-
-#     sentences_ids = sentences_tokenized.input_ids
-#     sentences_attention_mask = sentences_tokenized.attention_mask
-
-#     context_ids = contexts_tokenized.input_ids
-#     contexts_attention_mask = contexts_tokenized.attention_mask
-    
-#     if unrelated_contexts is not None:
-#         unrelated_contexts_ids = unrelated_contexts_tokenized.input_ids
-#         unrelated_contexts_attention_mask = unrelated_contexts_tokenized.attention_mask
-
-#     # mask contexts and unrelated_contexts
-#     if mask_ratio > 0.0:
-#         context_ids[torch.where(target_is_context_indicator==True)], contexts_attention_mask[torch.where(target_is_context_indicator==True)] = mask_tokens(context_ids[torch.where(target_is_context_indicator==True)], contexts_attention_mask[torch.where(target_is_context_indicator==True)], mask_strategy, mask_ratio, tokenizer)
-#         if unrelated_contexts is not None:
-#             unrelated_contexts_ids[torch.where(target_is_context_indicator==True)], unrelated_contexts_attention_mask[torch.where(target_is_context_indicator==True)] = mask_tokens(unrelated_contexts_ids[torch.where(target_is_context_indicator==True)], unrelated_contexts_attention_mask[torch.where(target_is_context_indicator==True)], mask_strategy, mask_ratio, tokenizer)
-
-#     # Create attention masks with total_length
-#     contexts_attention_mask = torch.cat([torch.tensor([1]*num_tokens).unsqueeze(0).repeat(contexts_tokenized.input_ids.shape[0], 1), 
-#                                          contexts_attention_mask], dim=-1)
-#     if unrelated_contexts is not None:
-#         unrelated_contexts_attention_mask = torch.cat([torch.tensor([1]*num_tokens).unsqueeze(0).repeat(contexts_tokenized.input_ids.shape[0], 1),
-#                                                     unrelated_contexts_attention_mask], dim=-1)
-#     sentences_attention_mask = torch.cat([torch.tensor([1]*num_tokens).unsqueeze(0).repeat(contexts_tokenized.input_ids.shape[0], 1),
-#                                           sentences_attention_mask], dim=-1)
-#     if unrelated_contexts is not None:
-#         return context_ids, contexts_attention_mask, sentences_ids, sentences_attention_mask, unrelated_contexts_ids, unrelated_contexts_attention_mask, torch.tensor(labels)
-#     else:
-#         return context_ids, contexts_attention_mask, sentences_ids, sentences_attention_mask, torch.tensor(labels)
-
-# # Then when you create the DataLoader:
-# collate_fn_with_params = partial(collate_fn, tokenizer=tokenizer, max_length=max_length, total_length=total_length)
-# data_loader = DataLoader(dataset, batch_size=32, collate_fn=collate_fn_with_params)
 
 def add_context_to_list(new_context_ids, cur_context_ids, all_contexts, max_length):
 
@@ -376,11 +316,13 @@ def collate_fn_qa(data, tokenizer, max_length, num_tokens,
                 end_special_token=None,
                 mask_strategy=None,
                 mask_ratio=None,
-                padding='longest'):
+                padding='longest',
+                is_ift=False,
+                return_idx=False):
                 
     eval_max_length = max_length if eval_max_length is None else eval_max_length
 
-    contexts, questions, answers, unrelated_contexts = zip(*data)
+    contexts, questions, answers, unrelated_contexts, idx = zip(*data)
 
     if end_special_token is not None:
         answers = [x + end_special_token for x in list(answers)]
@@ -391,12 +333,24 @@ def collate_fn_qa(data, tokenizer, max_length, num_tokens,
                                    truncation=True, 
                                    return_tensors='pt',
                                    add_special_tokens=add_special_tokens)
-    questions_tokenized = tokenizer(list(questions), 
-                                    max_length=eval_max_length,
-                                    truncation=True, 
-                                    padding='longest',
-                                    return_tensors='pt',
-                                    add_special_tokens=add_special_tokens)
+    
+    if is_ift:
+        questions_tokenized = []
+        for question in list(questions):
+            question_tokenized = tokenizer.apply_chat_template([{"role": "user", "content": question}],
+                                                               add_generation_prompt=True,
+                                                               return_tensors='pt')[0][1:]
+            questions_tokenized.append(question_tokenized)
+        questions_tokenized = torch.stack(questions_tokenized)
+
+    else:
+        questions_tokenized = tokenizer(list(questions), 
+                                        max_length=eval_max_length,
+                                        truncation=True, 
+                                        padding='longest',
+                                        return_tensors='pt',
+                                        add_special_tokens=add_special_tokens).input_ids
+    
     answers_tokenized = tokenizer(list(answers),
                                     max_length=eval_max_length,
                                     truncation=True,
@@ -404,42 +358,27 @@ def collate_fn_qa(data, tokenizer, max_length, num_tokens,
                                     return_tensors='pt',
                                     add_special_tokens=add_special_tokens)
 
-    # eg: batch_size: 4
-    # eg: time_steps: 8
-    # then unrelated_contexts would be 4 * 8; 
-    # I need it to be 8 * 4
-
     unrelated_contexts = np.array(unrelated_contexts).transpose().tolist()
 
     all_unrelated_contexts = {}
-    all_unrelated_contexts_mask = {}
     for i in range(len(unrelated_contexts)):
         all_unrelated_contexts[i] = tokenizer(unrelated_contexts[i],
                                     max_length=max_length,
-                                    # padding='max_length',
                                     truncation=True,
                                     padding=padding,
                                     return_tensors='pt',
                                     add_special_tokens=add_special_tokens)
-        all_unrelated_contexts_mask[i] = torch.cat([torch.tensor([1]*num_tokens).unsqueeze(0).repeat(all_unrelated_contexts[i].input_ids.shape[0], 1),
-                            all_unrelated_contexts[i].attention_mask], dim=-1)
 
-    # Create attention masks with total_length
-    contexts_attention_mask = torch.cat([torch.tensor([1]*num_tokens).unsqueeze(0).repeat(contexts_tokenized.input_ids.shape[0], 1), 
-                                         contexts_tokenized.attention_mask], dim=-1)
-    questions_attention_mask = torch.cat([torch.tensor([1]*num_tokens).unsqueeze(0).repeat(contexts_tokenized.input_ids.shape[0], 1), 
-                                          questions_tokenized.attention_mask], dim=-1)
-    answers_attention_mask = torch.cat([torch.tensor([1]*num_tokens).unsqueeze(0).repeat(contexts_tokenized.input_ids.shape[0], 1),
-                                         answers_tokenized.attention_mask], dim=-1)
-
-    outputs = (contexts_tokenized.input_ids, contexts_attention_mask, \
-        questions_tokenized.input_ids, questions_attention_mask, \
-        answers_tokenized.input_ids, answers_attention_mask)
+    outputs = (contexts_tokenized.input_ids, \
+        questions_tokenized, \
+        answers_tokenized.input_ids)
     
     for i in range(len(all_unrelated_contexts)):
         outputs += (all_unrelated_contexts[i].input_ids,)
-        outputs += (all_unrelated_contexts_mask[i],)
-        
+    
+    if return_idx:
+        outputs += (idx,)
+
     return outputs
 
 
@@ -521,3 +460,42 @@ def calculate_exact_hit_accuracy(preds, targets):
         if target.replace("<s>", "") in pred:
             hit += 1
     return hit / len(preds)
+
+def calculate_qa_f1_score(preds, targets):
+    return np.mean([qa_f1_score(pred, target) for pred, target in zip(preds, targets)])
+
+def normalize_answer(s):
+    """Lower text and remove punctuation, articles and extra whitespace."""
+
+    def remove_articles(text):
+        return re.sub(r"\b(a|an|the)\b", " ", text)
+
+    def white_space_fix(text):
+        return " ".join(text.split())
+
+    def remove_punc(text):
+        exclude = set(string.punctuation)
+        return "".join(ch for ch in text if ch not in exclude)
+
+    def lower(text):
+        return text.lower()
+
+    return white_space_fix(remove_articles(remove_punc(lower(s))))
+
+def f1_score(prediction, ground_truth, **kwargs):
+    common = Counter(prediction) & Counter(ground_truth)
+    num_same = sum(common.values())
+    if num_same == 0:
+        return 0
+    precision = 1.0 * num_same / len(prediction)
+    recall = 1.0 * num_same / len(ground_truth)
+    f1 = (2 * precision * recall) / (precision + recall)
+    return f1
+
+def qa_f1_score(prediction, ground_truth, **kwargs):
+    normalized_prediction = normalize_answer(prediction)
+    normalized_ground_truth = normalize_answer(ground_truth)
+
+    prediction_tokens = normalized_prediction.split()
+    ground_truth_tokens = normalized_ground_truth.split()
+    return f1_score(prediction_tokens, ground_truth_tokens)
