@@ -49,7 +49,6 @@ from transformers.utils import (
 )
 from transformers import LlamaConfig
 
-
 logger = logging.get_logger(__name__)
 
 _CONFIG_FOR_DOC = "LlamaConfig"
@@ -567,6 +566,7 @@ class LlamaFlashAttention2(LlamaAttention):
         random_retriever_length: Optional[int] = False,
         training: Optional[bool] = False,
         encoder_query_indices: Optional[torch.LongTensor] = None,
+        memory_key_indicators: Optional[torch.LongTensor] = None,
         encoder_attention_mask: Optional[torch.LongTensor] = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
         if isinstance(past_key_value, StaticCache):
@@ -592,6 +592,9 @@ class LlamaFlashAttention2(LlamaAttention):
 
                 sentence_hidden_states = hidden_states[:, prefix_token_length:]
                 memory_hidden_states = hidden_states[:, 1+ltm_length:prefix_token_length]
+                
+                # if memory_key_indicators is not None:
+                #     memory_hidden_states = memory_hidden_states[:, torch.where(memory_key_indicators)[0]]
 
                 if random_retriever_length:
                     assert not return_full_retriever_weights
@@ -888,7 +891,7 @@ class LlamaDecoderLayer(nn.Module):
         hidden_states = self.input_layernorm(hidden_states)
 
         # Self Attention
-        hidden_states, self_attn_weights, present_key_value, retriever_weights, encoder_retriever_weights = self.self_attn(
+        outputs = self.self_attn(
             hidden_states=hidden_states,
             attention_mask=attention_mask,
             position_ids=position_ids,
@@ -901,6 +904,14 @@ class LlamaDecoderLayer(nn.Module):
             encoder_query_indices=encoder_query_indices,
             **kwargs,
         )
+
+        if len(outputs) == 5:
+            hidden_states, self_attn_weights, present_key_value, retriever_weights, encoder_retriever_weights = outputs
+        else:
+            hidden_states, self_attn_weights, present_key_value = outputs
+            retriever_weights = None
+            encoder_retriever_weights = None
+
         hidden_states = residual + hidden_states
 
         # Fully Connected
@@ -1116,6 +1127,7 @@ class LlamaModel(LlamaPreTrainedModel):
         if use_cache and not isinstance(past_key_values, Cache):  # kept for BC (non `Cache` `past_key_values` inputs)
             return_legacy_cache = True
             past_key_values = DynamicCache.from_legacy_cache(past_key_values)
+
             logger.warning_once(
                 "We detected that you are passing `past_key_values` as a tuple and this is deprecated and will be removed in v4.43. "
                 "Please use an appropriate `Cache` class (https://huggingface.co/docs/transformers/v4.41.3/en/internal/generation_utils#transformers.Cache)"
@@ -1283,6 +1295,7 @@ class LlamaForCausalLM(LlamaPreTrainedModel):
         self.model = LlamaModel(config)
         self.vocab_size = config.vocab_size
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+        self.skip_logits_except_the_last_hidden_state = config.skip_logits_except_the_last_hidden_state if hasattr(config, "skip_logits_except_the_last_hidden_state") else False
 
         # Initialize weights and apply final processing
         self.post_init()
@@ -1372,7 +1385,10 @@ class LlamaForCausalLM(LlamaPreTrainedModel):
             logits = [F.linear(hidden_states, lm_head_slices[i]) for i in range(self.config.pretraining_tp)]
             logits = torch.cat(logits, dim=-1)
         else:
-            logits = self.lm_head(hidden_states)
+            if self.skip_logits_except_the_last_hidden_state:
+                logits = self.lm_head(hidden_states[:, -1:])
+            else:
+                logits = self.lm_head(hidden_states)
         logits = logits.float()
 
         loss = None

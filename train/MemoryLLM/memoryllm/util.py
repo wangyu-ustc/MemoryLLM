@@ -16,7 +16,6 @@ from queue import Queue
 import random 
 
 from inspect import isfunction
-from metrics import qa_f1_score
 from pytorch_lightning.callbacks import ModelCheckpoint
 
 
@@ -171,6 +170,8 @@ class ModelCheckpointLLM(ModelCheckpoint):
             torch.save(trainer.model.module.model.ltm, os.path.join(os.path.dirname(filepath), "ltm.pt"))
             # Save multiple arrays into a single .npz file
             np.savez(os.path.join(os.path.dirname(filepath), 'ltm_recall_frequency.npz'), *trainer.model.module.model.ltm_recall_frequencies)
+            np.savez(os.path.join(os.path.dirname(filepath), 'ltm_ages.npz'), *trainer.model.module.model.ltm_ages)
+            np.savez(os.path.join(os.path.dirname(filepath), 'memory_ages.npz'), *trainer.model.module.model.memory_ages)
 
 def select_mask_span(total_length, remaining_mask_count, max_span_length=20):
     start = random.randint(0, total_length - 1)  # random starting point
@@ -239,6 +240,81 @@ def mask_tokens(context_ids, contexts_attention_mask, mask_strategy, mask_ratio,
 
     return context_ids, contexts_attention_mask
 
+# def collate_fn(data, tokenizer, max_length, num_tokens, 
+#                     add_special_tokens=False, 
+#                     end_special_token=None, 
+#                     mask_strategy='word', 
+#                     mask_ratio=0.0,
+#                     padding='longest'):
+
+#     data = list(zip(*data))
+
+#     if len(data) == 4:
+#         contexts, sentences, target_is_context_indicator, labels = data
+#         unrelated_contexts = None
+
+#     else:
+#         unrelated_contexts, contexts, sentences, target_is_context_indicator, labels = data
+
+#     target_is_context_indicator = torch.tensor(target_is_context_indicator)
+
+#     if end_special_token is not None:
+#         sentences = [x + end_special_token for x in list(sentences)]
+    
+#     contexts_tokenized = tokenizer(list(contexts), 
+#                                    max_length=max_length, 
+#                                    padding=padding,
+#                                    truncation=True, 
+#                                    return_tensors='pt',
+#                                    add_special_tokens=add_special_tokens)
+
+#     if unrelated_contexts is not None:
+#         unrelated_contexts_tokenized = tokenizer(list(unrelated_contexts), 
+#                                    max_length=max_length, 
+#                                    padding=padding,
+#                                    truncation=True, 
+#                                    return_tensors='pt',
+#                                    add_special_tokens=add_special_tokens)
+
+#     sentences_tokenized = tokenizer(list(sentences), 
+#                                     max_length=max_length, 
+#                                     truncation=True, 
+#                                     padding='longest',
+#                                     return_tensors='pt',
+#                                     add_special_tokens=add_special_tokens)
+
+#     sentences_ids = sentences_tokenized.input_ids
+#     sentences_attention_mask = sentences_tokenized.attention_mask
+
+#     context_ids = contexts_tokenized.input_ids
+#     contexts_attention_mask = contexts_tokenized.attention_mask
+    
+#     if unrelated_contexts is not None:
+#         unrelated_contexts_ids = unrelated_contexts_tokenized.input_ids
+#         unrelated_contexts_attention_mask = unrelated_contexts_tokenized.attention_mask
+
+#     # mask contexts and unrelated_contexts
+#     if mask_ratio > 0.0:
+#         context_ids[torch.where(target_is_context_indicator==True)], contexts_attention_mask[torch.where(target_is_context_indicator==True)] = mask_tokens(context_ids[torch.where(target_is_context_indicator==True)], contexts_attention_mask[torch.where(target_is_context_indicator==True)], mask_strategy, mask_ratio, tokenizer)
+#         if unrelated_contexts is not None:
+#             unrelated_contexts_ids[torch.where(target_is_context_indicator==True)], unrelated_contexts_attention_mask[torch.where(target_is_context_indicator==True)] = mask_tokens(unrelated_contexts_ids[torch.where(target_is_context_indicator==True)], unrelated_contexts_attention_mask[torch.where(target_is_context_indicator==True)], mask_strategy, mask_ratio, tokenizer)
+
+#     # Create attention masks with total_length
+#     contexts_attention_mask = torch.cat([torch.tensor([1]*num_tokens).unsqueeze(0).repeat(contexts_tokenized.input_ids.shape[0], 1), 
+#                                          contexts_attention_mask], dim=-1)
+#     if unrelated_contexts is not None:
+#         unrelated_contexts_attention_mask = torch.cat([torch.tensor([1]*num_tokens).unsqueeze(0).repeat(contexts_tokenized.input_ids.shape[0], 1),
+#                                                     unrelated_contexts_attention_mask], dim=-1)
+#     sentences_attention_mask = torch.cat([torch.tensor([1]*num_tokens).unsqueeze(0).repeat(contexts_tokenized.input_ids.shape[0], 1),
+#                                           sentences_attention_mask], dim=-1)
+#     if unrelated_contexts is not None:
+#         return context_ids, contexts_attention_mask, sentences_ids, sentences_attention_mask, unrelated_contexts_ids, unrelated_contexts_attention_mask, torch.tensor(labels)
+#     else:
+#         return context_ids, contexts_attention_mask, sentences_ids, sentences_attention_mask, torch.tensor(labels)
+
+# # Then when you create the DataLoader:
+# collate_fn_with_params = partial(collate_fn, tokenizer=tokenizer, max_length=max_length, total_length=total_length)
+# data_loader = DataLoader(dataset, batch_size=32, collate_fn=collate_fn_with_params)
 
 def add_context_to_list(new_context_ids, cur_context_ids, all_contexts, max_length):
 
@@ -461,8 +537,6 @@ def calculate_exact_hit_accuracy(preds, targets):
             hit += 1
     return hit / len(preds)
 
-def calculate_qa_f1_score(preds, targets):
-    return np.mean([qa_f1_score(pred, target) for pred, target in zip(preds, targets)])
 
 def normalize_answer(s):
     """Lower text and remove punctuation, articles and extra whitespace."""
@@ -499,3 +573,24 @@ def qa_f1_score(prediction, ground_truth, **kwargs):
     prediction_tokens = normalized_prediction.split()
     ground_truth_tokens = normalized_ground_truth.split()
     return f1_score(prediction_tokens, ground_truth_tokens)
+
+def calculate_qa_f1_score(preds, targets):
+    f1_scores = []
+    for pred, target in zip(preds, targets):
+        f1_scores.append(qa_f1_score(pred.split("\n")[0], target))
+    return np.mean(f1_scores)
+
+def get_num_tokens(N, K, num_contexts):
+    ages = np.zeros(N)
+    for i in range(num_contexts):
+        indices = np.random.choice(np.arange(N), size=K, replace=False)
+        remaining_indices = np.setdiff1d(np.arange(N), indices)
+        ages = np.concatenate([
+            ages[remaining_indices],
+            np.array([i + 1] * K)
+        ])
+    # _, counts = np.unique(ages, return_counts=True)
+    counts = []
+    for age in np.arange(num_contexts + 1):
+        counts.append(np.sum(ages == age))
+    return counts

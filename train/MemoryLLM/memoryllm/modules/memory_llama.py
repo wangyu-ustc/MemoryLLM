@@ -13,6 +13,14 @@ from transformers.cache_utils import Cache, DynamicCache
 
 logger = logging.get_logger(__name__)
 
+class MemoryModule(nn.Module):
+
+    def __init__(self, L, num_tokens, d, requires_grad=False):
+        super(MemoryModule, self).__init__()
+        self.memory = nn.Parameter(torch.randn([L, num_tokens, d]))
+        self.memory.requires_grad = requires_grad
+        print(f"Memory Pool Parameters: {len(self.memory.reshape(-1)) / 1_000_000_000:.4f} B")
+    
 class LlamaDropMemoryModel(LlamaForCausalLM, BaseMemoryModel):
     def __init__(self, config):
         LlamaForCausalLM.__init__(self, config)
@@ -24,6 +32,7 @@ class LlamaDropMemoryModel(LlamaForCausalLM, BaseMemoryModel):
         self.num_blocks = config.num_blocks
         self.num_tokens = config.num_tokens
         self.bos_token_id = config.bos_token_id
+        self.virtual_num_blocks = config.virtual_num_blocks if hasattr(config, "virtual_num_blocks") else None
 
         self.add_bos_embedding = config.add_bos_embedding
         self.shrink_to_one_embedding = config.shrink_to_one_embedding
@@ -33,17 +42,23 @@ class LlamaDropMemoryModel(LlamaForCausalLM, BaseMemoryModel):
         self.special_token_ids = config.special_token_ids
         self.maintain_memory_keys = config.maintain_memory_keys if hasattr(config, "maintain_memory_keys") else False
 
+        self.skip_logits_except_the_last_hidden_state = False
+
         self.add_memory_embedding = False
         if hasattr(config, "add_memory_embedding") and config.add_memory_embedding:
-            self.memory_embeddings = nn.Parameter(torch.zeros([1, self.d]))
+            if config.spread_embeddings:
+                self.memory_embeddings = nn.Parameter(torch.zeros([self.num_tokens, self.d]))
+            else:
+                self.memory_embeddings = nn.Parameter(torch.zeros([1, self.d]))
+                
             self.add_memory_embedding = True
 
         self.memory = nn.Parameter(torch.randn([self.L, self.num_blocks * self.num_tokens, self.d]))
         print(f"Memory Pool Parameters: {len(self.memory.reshape(-1)) / 1_000_000_000:.4f} B")
+        self.memory.requires_grad = False
         self.memory_keys = None
 
         self.register_buffer("initialized", torch.tensor(0, dtype=torch.uint8))
-        self.memory.requires_grad = False
         self.add_positional_embedding = False
 
         self.new_memory_positional_emb = nn.Parameter(torch.zeros([1, 1, self.d]))
@@ -94,6 +109,8 @@ class LlamaDropMemoryModel(LlamaForCausalLM, BaseMemoryModel):
         # return_memory_keys: Optional[bool] = False,
         encoder_query_indices: Optional[List[int]] = None,
         parallel_injection: Optional[bool] = False,
+        scale_randomized_poe_ratio: Optional[bool] = None,
+        scale_randomized_poe_ratio_for_memory: Optional[bool] = None,
         debug: Optional[bool] = False
     ) -> Union[Tuple, MemoryLMOutputWithPastAndCrossAttentions]:
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
@@ -201,6 +218,25 @@ class LlamaDropMemoryModel(LlamaForCausalLM, BaseMemoryModel):
         # TODO: currently ignore position_ids
             
         position_ids = cache_position.unsqueeze(0)
+
+        if not is_injection and self.initialized and (not (delta_memory is not None and not cat_to_maximum_memory)):
+
+            if scale_randomized_poe_ratio_for_memory is not None:
+                input_poes = position_ids[:, 1:-inputs_embeds.shape[1]]
+                start_poe = input_poes[0, 0]
+                # choose input_poes.shape[1] positions from int(2048 * scale_randomized_poe_ratio):
+                all_indices = torch.randperm(int((self.num_blocks * self.num_tokens) * scale_randomized_poe_ratio_for_memory)) + start_poe.item()
+                input_poes = all_indices[:input_poes.shape[1]].sort()[0]
+                position_ids[:, 1:-inputs_embeds.shape[1]] = input_poes.to(position_ids.device)
+                position_ids[:, -inputs_embeds.shape[1]:] += (scale_randomized_poe_ratio_for_memory - 1) * (self.num_blocks * self.num_tokens)
+
+            if scale_randomized_poe_ratio is not None:
+                input_poes = position_ids[:, -inputs_embeds.shape[1]:]
+                start_poe = input_poes[0, 0]
+                # choose input_poes.shape[1] positions from int(2048 * scale_randomized_poe_ratio):
+                all_indices = torch.randperm(int(2048 * scale_randomized_poe_ratio)) + start_poe.item()
+                input_poes = all_indices[:input_poes.shape[1]].sort()[0]        
+                position_ids[:, -inputs_embeds.shape[1]:] = input_poes.to(position_ids.device)
 
         # TODO: check why sometimes there are zeros in attention_mask
         # causal_mask = self.model._update_causal_mask(
@@ -366,7 +402,10 @@ class LlamaDropMemoryModel(LlamaForCausalLM, BaseMemoryModel):
             logits = [F.linear(hidden_states, lm_head_slices[i]) for i in range(self.config.pretraining_tp)]
             logits = torch.cat(logits, dim=-1)
         else:
-            logits = self.lm_head(hidden_states)
+            if self.skip_logits_except_the_last_hidden_state:
+                logits = self.lm_head(hidden_states[:, -1:])
+            else:
+                logits = self.lm_head(hidden_states)
         logits = logits.float()
 
         loss = None
@@ -421,16 +460,10 @@ class LlamaDropMemoryTreeModel(LlamaForCausalLM, BaseMemoryModel):
         self.maintain_memory_keys = config.maintain_memory_keys if hasattr(config, "maintain_memory_keys") else False
         self.dropping_interval = config.dropping_interval if hasattr(config, "dropping_interval") else 16
         self.min_num_tokens = config.min_num_tokens if hasattr(config, "min_num_tokens") else 25
-
-        self.add_memory_embedding = False
-        if hasattr(config, "add_memory_embedding") and config.add_memory_embedding:
-            self.memory_embeddings = nn.Parameter(torch.zeros([1, self.d]))
-            self.add_memory_embedding = True
+        self.fix_poe_for_encoder = config.fix_poe_for_encoder if hasattr(config, "fix_poe_for_encoder") else False
 
         self.register_buffer("initialized", torch.tensor(0, dtype=torch.uint8))
         self.add_positional_embedding = False
-
-        self.new_memory_positional_emb = nn.Parameter(torch.zeros([1, 1, self.d]))
 
         if config.add_bos_embedding:
             self.bos_embedding = nn.Parameter(torch.randn([self.L, 1, self.d]))
@@ -448,27 +481,49 @@ class LlamaDropMemoryTreeModel(LlamaForCausalLM, BaseMemoryModel):
             self.ltm_keys = [None] * self.L
             self.ltm_ages = [None] * self.L
             self.ltm_recall_frequencies = [None] * self.L
+
+            if hasattr(config.ltm_configs, "use_cache") and config.ltm_configs.use_cache:
+                self.ltm_use_cache = True
+                self.ltm_cache = [None] * self.L
+                self.ltm_keys_cache = [None] * self.L
+                self.ltm_ages_cache = [None] * self.L
+                self.ltm_recall_frequencies = [None] * self.L
+            else:
+                self.ltm_use_cache = False
+
             self.initial_rf_when_moving_stm_to_ltm = config.ltm_configs.get("initial_rf_when_moving_stm_to_ltm", 10)
             self.decay_frequency = config.ltm_configs.get("decay_frequency", 0.05)
             self.num_ltm_blocks = config.ltm_configs.get("num_ltm_blocks", 20)
             
             assert self.num_blocks > self.num_ltm_blocks
 
-            ideal_list = [self.num_tokens * (1 - 1/(self.num_blocks - self.num_ltm_blocks))**i for i in range(1000)]
+            ideal_list = [self.num_tokens * (1 - 1/(self.num_blocks))**i for i in range(1000)]
             final_list = [math.ceil(x / self.dropping_interval) * self.dropping_interval for x in ideal_list]
+            final_list = [x for x in final_list if x >= self.min_num_tokens]
             while sum(final_list) > (self.num_blocks - self.num_ltm_blocks) * self.num_tokens:
                 final_list = final_list[:-1]
-            
+
+            print(f"Short-Term Memory can last {len(final_list)} steps")
+            print(f"Last chunk has {final_list[-1]} tokens")
+
             remaining_indicators = []
             importance_indicators = []
 
             for idx, frequency in enumerate(final_list[:-1]):
-                remaining_indicators.extend(
-                    [1] * final_list[idx+1] + [0] * (frequency - final_list[idx+1])
-                )
-                importance_indicators.extend(
-                    [1] * final_list[-1] + [0] * (frequency - final_list[-1])
-                )
+                if config.important_tokens == 'right':
+                    remaining_indicators.extend(
+                        [1] * final_list[idx+1] + [0] * (frequency - final_list[idx+1])
+                    )
+                    importance_indicators.extend(
+                        [1] * final_list[-1] + [0] * (frequency - final_list[-1])
+                    )
+                else:
+                    remaining_indicators.extend(
+                        [0] * (frequency - final_list[idx+1]) + [1] * final_list[idx+1]
+                    )
+                    importance_indicators.extend(
+                        [0] * final_list[-1] + [1] * (frequency - final_list[-1])
+                    )
 
             importance_indicators.extend([1] * final_list[-1])
             remaining_indicators.extend([0] * final_list[-1])
@@ -494,14 +549,19 @@ class LlamaDropMemoryTreeModel(LlamaForCausalLM, BaseMemoryModel):
             # get the memory dropping schedule
             ideal_list = [self.num_tokens * (1 - 1/self.num_blocks)**i for i in range(1000)]
             final_list = [math.ceil(x / self.dropping_interval) * self.dropping_interval for x in ideal_list]
-            final_list = [x for x in final_list if x > self.min_num_tokens]
+            final_list = [x for x in final_list if x >= self.min_num_tokens]
             while sum(final_list) > self.num_blocks * self.num_tokens:
                 final_list = final_list[:-1]
             remaining_indicators = []
             for idx, frequency in enumerate(final_list[:-1]):
-                remaining_indicators.extend(
-                    [1] * final_list[idx+1] + [0] * (frequency - final_list[idx+1])
-                )
+                if config.important_tokens == 'right':
+                    remaining_indicators.extend(
+                        [1] * final_list[idx+1] + [0] * (frequency - final_list[idx+1])
+                    )
+                else:
+                    remaining_indicators.extend(
+                        [0] * (frequency - final_list[idx+1]) + [1] * final_list[idx+1]
+                    )
             remaining_indicators.extend([0] * final_list[-1])
             remaining_indicators = remaining_indicators[::-1]
             self.final_list = final_list[::-1]
@@ -519,8 +579,52 @@ class LlamaDropMemoryTreeModel(LlamaForCausalLM, BaseMemoryModel):
         # if r_0 = 100, s = 0.05, then we have `num = (2560 + 3200) / 0.05 = 115200`
         # Then every token would be maintained in LTM for r_0 / s = 2000 steps, leading to 2000 * 512 = 1_024_000 tokens
 
+        self.important_tokens = config.important_tokens
         self.memory.requires_grad = False
         self._detach_memory = False
+
+        self.add_memory_embedding = False
+
+        if hasattr(config, "add_memory_embedding") and config.add_memory_embedding:
+            
+            if config.spread_embeddings:
+                
+                # self.memory_embeddings = nn.Parameter(torch.zeros([self.num_tokens, self.d]))
+                # np.min(self.final_list), ..., 256 (+self.dropping_interval each time)
+                
+                memory_position_ids = []
+                count = 0
+
+                # self.unique_memory_numbers needs to be ascending
+                self.unique_memory_numbers = np.sort(self.unique_memory_numbers).tolist()
+
+                for num in self.unique_memory_numbers:
+
+                    if num == np.min(self.final_list):
+                        memory_position_ids.extend([count] * num)
+                    else:
+                        memory_position_ids.extend([count] * (num - last_num))
+
+                    last_num = num
+                    count += 1
+
+                # self.memory_embeddings = nn.ModuleList([nn.Parameter(torch.zeros([1, self.d])) for _ in range(len(self.unique_memory_numbers))])
+                self.memory_embeddings = nn.Parameter(torch.zeros([len(self.unique_memory_numbers), self.d]))
+
+                if config.important_tokens == 'right':
+                    memory_position_ids = memory_position_ids[::-1]
+
+                self.memory_position_ids = torch.tensor(memory_position_ids)
+
+                # self.memory_position_ids = [(num - np.min(self.final_list)) // self.dropping_interval for num in self.unique_memory_numbers]
+
+            else:
+                self.memory_embeddings = nn.Parameter(torch.zeros([1, self.d]))
+            self.add_memory_embedding = True
+
+        else:
+
+            self.new_memory_positional_emb = nn.Parameter(torch.zeros([1, 1, self.d]))
 
     def set_exclude_layers(self, layer_indices):
         self.exclude_layers = layer_indices
@@ -558,100 +662,121 @@ class LlamaDropMemoryTreeModel(LlamaForCausalLM, BaseMemoryModel):
 
             if self.use_ltm:
 
-                self.memory_ages = torch.zeros(self.memory.shape[1])
+                self.memory_ages = torch.zeros(self.memory.shape[1], dtype=torch.int)
 
                 # initialize LTM
                 self.fill_in_ltm(delta_memory)
+                self.ltm_ages = [torch.tensor(x) for x in self.ltm_ages]
 
             self.initialized += 1
 
         else:
 
-            if self.memory.data.shape[1] == delta_memory.shape[1]:
+            # if self.memory.data.shape[1] == delta_memory.shape[1]:
 
-                ages_to_add = len(self.final_list)
-                self.memory.data = delta_memory
-                remaining_indices = None
-                if cached_contexts_indicators is not None:
-                    cached_contexts_indicators = torch.zeros_like(cached_contexts_indicators)
+            #     ages_to_add = len(self.final_list)
+            #     self.memory.data = delta_memory
+            #     remaining_indices = None
+            #     if cached_contexts_indicators is not None:
+            #         cached_contexts_indicators = torch.zeros_like(cached_contexts_indicators)
 
-            else:
+            # else:
 
-                remaining_indices = torch.arange(self.memory.shape[1])
+            remaining_indices = torch.arange(self.memory.shape[1])
 
-                ages_to_add = 0
-                # TODO: this while loop can be pre-computed and optimized
-                # TODO: there should be a mapping from `delta_memory.shape[1]` to `ages_to_add` and `remaining_indices`
-                while len(remaining_indices) + delta_memory.shape[1] > self.num_memory_tokens:
-                    ages_to_add += 1
-                    remaining_indices = remaining_indices[self.remaining_indicators[:len(remaining_indices)]]
+            ages_to_add = 0
+            # TODO: this while loop can be pre-computed and optimized
+            # TODO: there should be a mapping from `delta_memory.shape[1]` to `ages_to_add` and `remaining_indices`
+            while len(remaining_indices) + delta_memory.shape[1] > self.num_memory_tokens:
+                ages_to_add += 1
+                remaining_indices = remaining_indices[self.remaining_indicators[:len(remaining_indices)]]
 
-                assert len(remaining_indices) + delta_memory.shape[1] == self.num_memory_tokens
+            assert len(remaining_indices) + delta_memory.shape[1] == self.num_memory_tokens
 
-                if self.use_ltm:
-                    self.memory_ages += ages_to_add
-                    dropped_indices = np.setdiff1d(np.arange(self.num_memory_tokens), remaining_indices.cpu().numpy())
-                    dropped_indices = dropped_indices[torch.where(self.importance_indicators[dropped_indices])[0]]
-                    dropped_ages = self.memory_ages[dropped_indices]
-                    dropped_memory = self.memory.data[:, dropped_indices]
+            if self.use_ltm:
 
-                self.memory.data = torch.cat([
-                    self.memory.data[:, remaining_indices],
-                    delta_memory
-                ], dim=1)
+                self.memory_ages += ages_to_add
+                self.ltm_ages = [x + ages_to_add for x in self.ltm_ages]
 
-                if self.memory.shape[1] != self.num_memory_tokens:
-                    import ipdb; ipdb.set_trace()
+                dropped_indices = np.setdiff1d(np.arange(self.num_memory_tokens), remaining_indices.cpu().numpy())
+                dropped_indices = dropped_indices[torch.where(self.importance_indicators[dropped_indices])[0]]
+                dropped_ages = self.memory_ages[dropped_indices]
+                dropped_memory = self.memory.data[:, dropped_indices]
 
-                if cached_contexts_indicators is not None:
-                    if len(cached_contexts_indicators.shape) == 3:
-                        # cached_contexts_indicators: [1, L, num_memory_tokens]
-                        cached_contexts_indicators = torch.cat([
-                            cached_contexts_indicators[:, :, remaining_indices],
-                            torch.zeros([cached_contexts_indicators.shape[0], cached_contexts_indicators.shape[1], delta_memory.shape[1]]).to(cached_contexts_indicators.device)
-                        ], dim=2)
-                    else:
-                        # cached_contexts_indicators: [L, num_memory_tokens]
-                        cached_contexts_indicators = torch.cat([
-                            cached_contexts_indicators[:, remaining_indices],
-                            torch.zeros([cached_contexts_indicators.shape[0], delta_memory.shape[1]]).to(cached_contexts_indicators.device)
-                        ], dim=1)
-                
-                if self.use_ltm:
+            self.memory.data = torch.cat([
+                self.memory.data[:, remaining_indices],
+                delta_memory
+            ], dim=1)
 
-                    new_ages = []
-                    for num_idx, num in enumerate(self.final_list[-ages_to_add:]):
-                        new_ages.extend([ages_to_add - num_idx - 1] * num)
+            if cached_contexts_indicators is not None:
+                if len(cached_contexts_indicators.shape) == 3:
+                    # cached_contexts_indicators: [1, L, num_memory_tokens]
+                    cached_contexts_indicators = torch.cat([
+                        cached_contexts_indicators[:, :, remaining_indices],
+                        torch.zeros([cached_contexts_indicators.shape[0], cached_contexts_indicators.shape[1], delta_memory.shape[1]]).to(cached_contexts_indicators.device)
+                    ], dim=2)
+                else:
+                    # cached_contexts_indicators: [L, num_memory_tokens]
+                    cached_contexts_indicators = torch.cat([
+                        cached_contexts_indicators[:, remaining_indices],
+                        torch.zeros([cached_contexts_indicators.shape[0], delta_memory.shape[1]]).to(cached_contexts_indicators.device)
+                    ], dim=1)
+            
+            if self.use_ltm:
 
-                    self.memory_ages = torch.cat(
-                        [self.memory_ages[remaining_indices],
-                        torch.tensor(new_ages)]
-                    )
+                new_ages = []
+                for num_idx, num in enumerate(self.final_list[-ages_to_add:]):
+                    new_ages.extend([ages_to_add - num_idx - 1] * num)
 
-                    # update LTM
-                    with torch.no_grad():
-                        
-                        for idx in range(self.L):
-                            self.ltm[idx] = torch.cat([
-                                self.ltm[idx],
-                                dropped_memory[idx].detach().cpu()
-                            ])
-                            self.ltm_ages[idx] = torch.cat([
-                                self.ltm_ages[idx],
-                                dropped_ages.detach().cpu()
-                            ])
-                            self.ltm_keys[idx] = torch.cat([
-                                self.ltm_keys[idx],
-                                self.model.layers[idx].self_attn.key_proj(
-                                    self.model.layers[idx].input_layernorm(
-                                        dropped_memory[idx]
-                                    )
-                                ).detach().cpu()
-                            ])
-                            self.ltm_recall_frequencies[idx] = torch.cat([
-                                self.ltm_recall_frequencies[idx],
-                                self.initial_rf_when_moving_stm_to_ltm * torch.ones(len(dropped_ages))
-                            ])
+                self.memory_ages = torch.cat(
+                    [self.memory_ages[remaining_indices],
+                    torch.tensor(new_ages)]
+                )
+
+                # update LTM
+                with torch.no_grad():
+                    
+                    for idx in range(self.L):
+
+                        # use delta_memory to recall LTM
+                        # delta_memory: [32, 256, 4096]
+                        if len(self.ltm_keys[idx]) > (self.num_ltm_tokens * ages_to_add):
+                            queries = self.model.layers[idx].self_attn.encoder_query_proj(self.model.layers[idx].input_layernorm(delta_memory[idx]))
+                            predictions = (queries @ self.ltm_keys[idx].to(queries.device).transpose(-2, -1)).sigmoid().mean(dim=0)
+                            indices = torch.topk(predictions, k=(self.num_ltm_tokens * ages_to_add))[1].cpu()
+                            self.ltm_keys[idx][indices] += 1
+
+                        self.ltm[idx] = torch.cat([
+                            self.ltm[idx],
+                            dropped_memory[idx].detach().cpu()
+                        ])
+                        self.ltm_ages[idx] = torch.cat([
+                            self.ltm_ages[idx],
+                            dropped_ages.detach().cpu()
+                        ])
+                        self.ltm_keys[idx] = torch.cat([
+                            self.ltm_keys[idx],
+                            self.model.layers[idx].self_attn.key_proj(
+                                self.model.layers[idx].input_layernorm(
+                                    dropped_memory[idx]
+                                )
+                            ).detach().cpu()
+                        ])
+                        self.ltm_recall_frequencies[idx] = torch.cat([
+                            self.ltm_recall_frequencies[idx],
+                            self.initial_rf_when_moving_stm_to_ltm * torch.ones(len(dropped_ages))
+                        ])
+
+                        self.ltm_recall_frequencies[idx] -= self.decay_frequency
+                        indices = np.where(self.ltm_recall_frequencies[idx] > 0.01)[0] # sometimes it may be "2.0539126e-15", using 0.01 to filter out these cases
+                        if len(indices) > self.num_ltm_blocks * self.num_tokens:
+                            self.ltm[idx] = self.ltm[idx][indices]
+                            self.ltm_keys[idx] = self.ltm_keys[idx][indices]
+                            self.ltm_recall_frequencies[idx] = self.ltm_recall_frequencies[idx][indices]
+                            self.ltm_ages[idx] = self.ltm_ages[idx][indices]
+
+                        else:
+                            self.ltm_recall_frequencies[idx] += self.decay_frequency
 
             if cached_contexts_indicators is not None:
                 return cached_contexts_indicators
@@ -660,6 +785,7 @@ class LlamaDropMemoryTreeModel(LlamaForCausalLM, BaseMemoryModel):
                                is_injection=False,
                                cat_to_maximum_memory=False,
                                random_retriever_length=False,
+                               delta_memory_position_idx=None,
                                training=False):
         
         if not self.initialized:
@@ -680,16 +806,30 @@ class LlamaDropMemoryTreeModel(LlamaForCausalLM, BaseMemoryModel):
                     pass
                 else:
 
-                    remaining_indices = torch.arange(self.memory.shape[1])
+                    if delta_memory_position_idx is not None:
+                        
+                        start_memory_position_idx = self.final_list[:delta_memory_position_idx].sum() if delta_memory_position_idx > 0 else 0
+                        old_memory = self.memory[idx].detach()
+                        # old_memory[:, start_memory_position_idx:start_memory_position_idx+cur_memory.shape[1]] = cur_memory
+                        # cur_memory = old_memory.unsqueeze(0)
+                        cur_memory = torch.cat([
+                            old_memory[:, :start_memory_position_idx].unsqueeze(0),
+                            cur_memory,
+                            old_memory[:, start_memory_position_idx+cur_memory.shape[1]:].unsqueeze(0)
+                        ], dim=1)
 
-                    while len(remaining_indices) + cur_memory.shape[1] > self.num_memory_tokens:
-                        # tmp_memory = tmp_memory[:, self.remaining_indicators[:tmp_memory.shape[1]]]
-                        remaining_indices = remaining_indices[self.remaining_indicators[:len(remaining_indices)]]
+                    else:
 
-                    cur_memory = torch.cat([
-                        self.memory[idx].detach()[remaining_indices].unsqueeze(0),
-                        cur_memory
-                    ], dim=1)
+                        remaining_indices = torch.arange(self.memory.shape[1])
+
+                        while len(remaining_indices) + cur_memory.shape[1] > self.num_memory_tokens:
+                            # tmp_memory = tmp_memory[:, self.remaining_indicators[:tmp_memory.shape[1]]]
+                            remaining_indices = remaining_indices[self.remaining_indicators[:len(remaining_indices)]]
+
+                        cur_memory = torch.cat([
+                            self.memory[idx].detach()[remaining_indices].unsqueeze(0),
+                            cur_memory
+                        ], dim=1)
 
         ltm_indices = None
         if self.use_ltm and (not is_injection) and not (delta_memory is not None and cat_to_maximum_memory == False):
@@ -728,6 +868,8 @@ class LlamaDropMemoryTreeModel(LlamaForCausalLM, BaseMemoryModel):
         training: Optional[bool] = False,
         # return_memory_keys: Optional[bool] = False,
         encoder_query_indices: Optional[List[int]] = None,
+        memory_key_indicators: Optional[torch.BoolTensor] = None,
+        delta_memory_position_idx: Optional[torch.LongTensor] = None,
         parallel_injection: Optional[bool] = False,
         debug: Optional[bool] = False
     ) -> Union[Tuple, MemoryLMOutputWithPastAndCrossAttentions]:
@@ -771,11 +913,23 @@ class LlamaDropMemoryTreeModel(LlamaForCausalLM, BaseMemoryModel):
                 inputs_embeds = torch.stack(new_inputs_embeds).unsqueeze(0)
 
             if self.add_memory_embedding and is_injection:
-                if inputs_embeds.shape[1] < self.num_tokens:
+
+                if self.memory_embeddings.shape[0] == 1:
                     inputs_embeds = torch.cat([
                         inputs_embeds,
-                        self.memory_embeddings.unsqueeze(0).repeat(1, self.num_tokens - inputs_embeds.shape[1], 1)
+                        self.memory_embeddings.unsqueeze(0).repeat(1, self.num_tokens, 1)
                     ], dim=1)
+                else:
+                    inputs_embeds = torch.cat([
+                        inputs_embeds,
+                        self.memory_embeddings[self.memory_position_ids].unsqueeze(0)
+                    ], dim=1)
+                
+                # if inputs_embeds.shape[1] < self.num_tokens:
+                #     inputs_embeds = torch.cat([
+                #         inputs_embeds,
+                #         self.memory_embeddings.unsqueeze(0).repeat(1, self.num_tokens - inputs_embeds.shape[1], 1)
+                #     ], dim=1)
 
         return_legacy_cache = False
         if use_cache and not isinstance(past_key_values, Cache):  # kept for BC (non `Cache` `past_key_values` inputs)
@@ -808,9 +962,27 @@ class LlamaDropMemoryTreeModel(LlamaForCausalLM, BaseMemoryModel):
                             0, inputs_embeds.shape[1] + self.num_tokens + int(self.add_bos_embedding), device=inputs_embeds.device
                         )
                 elif delta_memory is not None and delta_memory.shape[2] < self.num_memory_tokens and not cat_to_maximum_memory:
-                    cache_position = torch.arange(
-                        0, inputs_embeds.shape[1] + delta_memory.shape[2] + int(self.add_bos_embedding), device=inputs_embeds.device
-                    )
+                    
+                    if self.fix_poe_for_encoder:
+
+                        memory_pos = torch.arange(1, 1 + self.num_memory_tokens)
+
+                        if self.important_tokens == "right":
+                            memory_pos = memory_pos[-delta_memory.shape[2]:]
+                        else:
+                            memory_pos = memory_pos[:delta_memory.shape[2]]
+                        
+                        cache_position = torch.cat([
+                            torch.arange(0, int(self.add_bos_embedding)),
+                            memory_pos,
+                            torch.arange(int(self.add_bos_embedding) + self.num_memory_tokens, int(self.add_bos_embedding) + self.num_memory_tokens + inputs_embeds.shape[1])
+                        ]).to(inputs_embeds.device)
+
+                    else:
+                        cache_position = torch.arange(
+                            0, inputs_embeds.shape[1] + delta_memory.shape[2] + int(self.add_bos_embedding), device=inputs_embeds.device
+                        )
+
                 else:
                     if self._detach_memory:
                         cache_position = torch.arange(
@@ -890,7 +1062,9 @@ class LlamaDropMemoryTreeModel(LlamaForCausalLM, BaseMemoryModel):
                                                     is_injection=is_injection,
                                                     cat_to_maximum_memory=cat_to_maximum_memory,
                                                     random_retriever_length=random_retriever_length,
+                                                    delta_memory_position_idx=delta_memory_position_idx,
                                                     training=training)
+                        
                         if ltm_indices is not None:
                             all_ltm_indices += (ltm_indices,)
 
@@ -902,10 +1076,10 @@ class LlamaDropMemoryTreeModel(LlamaForCausalLM, BaseMemoryModel):
                 
                 prefix_token_length = hidden_states.shape[1] - inputs_embeds.shape[1] if self.initialized else 0
 
-                if is_injection and prefix_token_length > 0:
+                if is_injection and prefix_token_length > 0 and not self.add_memory_embedding:
                     prefix_token_length = min(prefix_token_length, hidden_states.shape[1] - self.num_tokens)
 
-                if is_injection:
+                if is_injection and not self.add_memory_embedding:
                     if self.new_memory_positional_emb.device != hidden_states.device:
                         hidden_states[:, -self.num_tokens:] += self.new_memory_positional_emb.to(hidden_states.device)
                     else:
@@ -937,26 +1111,24 @@ class LlamaDropMemoryTreeModel(LlamaForCausalLM, BaseMemoryModel):
 
                 assert not (is_injection and encoder_query_indices)
                 
-                try:
-                    layer_outputs = decoder_layer(
-                        hidden_states,
-                        attention_mask=causal_mask,
-                        position_ids=position_ids,
-                        past_key_value=past_key_values,
-                        output_attentions=output_attentions,
-                        use_cache=use_cache,
-                        cache_position=cache_position,
-                        prefix_token_length=prefix_token_length,
-                        output_retriever_weights=output_retriever_weights,
-                        return_full_retriever_weights=return_full_retriever_weights,
-                        random_retriever_length=random_retriever_length,
-                        encoder_query_indices=encoder_query_indices[idx] if encoder_query_indices is not None else None,
-                        encoder_attention_mask=encoder_attention_mask,
-                        ltm_length=self.num_ltm_tokens if self.use_ltm else 0,
-                        training=training,
-                    )
-                except:
-                    import ipdb; ipdb.set_trace()
+                layer_outputs = decoder_layer(
+                    hidden_states,
+                    attention_mask=causal_mask,
+                    position_ids=position_ids,
+                    past_key_value=past_key_values,
+                    output_attentions=output_attentions,
+                    use_cache=use_cache,
+                    cache_position=cache_position,
+                    prefix_token_length=prefix_token_length,
+                    output_retriever_weights=output_retriever_weights,
+                    return_full_retriever_weights=return_full_retriever_weights,
+                    random_retriever_length=random_retriever_length,
+                    encoder_query_indices=encoder_query_indices[idx] if encoder_query_indices is not None else None,
+                    encoder_attention_mask=encoder_attention_mask,
+                    ltm_length=self.num_ltm_tokens if self.use_ltm else 0,
+                    training=training,
+                    memory_key_indicators=memory_key_indicators,
+                )
 
             hidden_states = layer_outputs[0]
             if output_delta_memory:
@@ -1038,6 +1210,7 @@ class LlamaDropMemoryTreeModel(LlamaForCausalLM, BaseMemoryModel):
             # memory_keys=all_memory_keys if (all_memory_keys is not None and len(all_memory_keys) > 0) else None
         )
 
+        
 class LlamaDropMemoryLTMModel(LlamaForCausalLM, BaseMemoryModel):
     def __init__(self, config):
         LlamaForCausalLM.__init__(self, config)
@@ -1056,6 +1229,7 @@ class LlamaDropMemoryLTMModel(LlamaForCausalLM, BaseMemoryModel):
         self.tune_special_tokens = config.tune_special_tokens
         self.special_token_ids = config.special_token_ids
         self.maintain_memory_keys = config.maintain_memory_keys if hasattr(config, "maintain_memory_keys") else False
+        self.virtual_num_blocks = config.virtual_num_blocks if hasattr(config, "virtual_num_blocks") else None
 
         # long-term memory configurations
         self.num_ltm_blocks = config.num_ltm_blocks if hasattr(config, "num_ltm_blocks") else 10
@@ -1083,6 +1257,8 @@ class LlamaDropMemoryLTMModel(LlamaForCausalLM, BaseMemoryModel):
         self.ltm_ages = [None] * self.L
         self.ltm_recall_frequencies = [None] * self.L
         self.initial_rf_when_moving_stm_to_ltm = config.initial_rf_when_moving_stm_to_ltm if hasattr(config, "initial_rf_when_moving_stm_to_ltm") else None
+        self.put_cached_dropped_memory_on_cpu = config.put_cached_dropped_memory_on_cpu if hasattr(config, "put_cached_dropped_memory_on_cpu") else False
+
         # self.ltm_keys = [[None] * config.num_key_value_heads] * self.L
         # self.ltm_values = [[None] * config.num_key_value_heads] * self.L
         # self.ltm_recall_frequencies = [[None] * config.num_key_value_heads] * self.L
@@ -1091,8 +1267,9 @@ class LlamaDropMemoryLTMModel(LlamaForCausalLM, BaseMemoryModel):
         print(f"Memory Pool Parameters: {len(self.memory.reshape(-1)) / 1_000_000_000:.4f} B")
         self.memory_keys = None
         self.memory_ages = [None] * self.L
-        self.memory_recall_frequency = [torch.zeros([self.memory.shape[1]]) for _ in range(self.L)]
-        self.memory_position_indicators = [torch.zeros(self.memory.shape[1]) for _ in range(self.L)]
+        self.memory_recall_frequency = [np.zeros([self.memory.shape[1]]) for _ in range(self.L)]
+        self.memory_position_indicators = [np.zeros(self.memory.shape[1]) for _ in range(self.L)]
+        self.maintain_memory_keys = config.maintain_memory_keys if hasattr(config, "maintain_memory_keys") else False
 
         self.register_buffer("initialized", torch.tensor(0, dtype=torch.uint8))
         self.memory.requires_grad = False
@@ -1110,6 +1287,9 @@ class LlamaDropMemoryLTMModel(LlamaForCausalLM, BaseMemoryModel):
 
         self._detach_memory = False
         self.cached_dropped_memories, self.cached_dropped_memory_ages = None, None
+        self.cached_dropped_keys = None
+
+        self.skip_logits_except_the_last_hidden_state = False
 
     def set_exclude_layers(self, layer_indices):
         self.exclude_layers = layer_indices
@@ -1123,6 +1303,79 @@ class LlamaDropMemoryLTMModel(LlamaForCausalLM, BaseMemoryModel):
     def attach_memory(self):
         self._detach_memory = False
 
+    def fill_in_ltm(self, delta_memory):
+
+        if len(delta_memory.shape) == 4:
+            delta_memory = delta_memory.detach()[0]
+
+        with torch.no_grad():
+            for idx in range(len(self.memory)):
+                # current_memory = self.memory.data[idx]
+                # self.ltm[idx] = current_memory[-self.num_tokens * self.num_ltm_blocks:].detach().cpu()
+                self.ltm[idx] = delta_memory[idx].detach().cpu()
+                self.ltm_recall_frequencies[idx] = np.zeros(self.ltm[idx].shape[0])
+                self.ltm_keys[idx] = self.model.layers[idx].self_attn.key_proj(self.model.layers[idx].input_layernorm(delta_memory[idx].detach())).cpu()
+                self.ltm_ages[idx] = np.zeros(self.ltm[idx].shape[0])
+
+    def update_memory_with_delta_memory_and_keys(self,
+                                                delta_memory, 
+                                                delta_memory_ages,
+                                                dropped_delta_memory,
+                                                dropped_delta_memory_keys,
+                                                dropped_delta_memory_ages):
+
+        if len(dropped_delta_memory.shape) == 4:
+            dropped_delta_memory = dropped_delta_memory[0]
+        if len(dropped_delta_memory_keys.shape) == 4:
+            dropped_delta_memory_keys = dropped_delta_memory_keys[0]
+
+        max_delta_memory_age = max(delta_memory_ages.max().item(), dropped_delta_memory_ages.max().item())
+        # call the update_memory_with_delta_memory function from the base class
+        outputs = BaseMemoryModel.update_memory_with_delta_memory(self, 
+                                    delta_memory.to(self.memory.device) if delta_memory.device != self.memory.device else delta_memory, 
+                                    is_ltm=True, 
+                                    cached_contexts_indicators=None, 
+                                    retriever_weights=None,
+                                    delta_memory_ages=delta_memory_ages,
+                                    return_dropped_memories=True)
+
+        ages_to_add = 1 + max_delta_memory_age
+
+        # update ages
+        for idx in range(self.L):
+            self.ltm_ages[idx] += ages_to_add
+            if self.cached_dropped_memory_ages is not None:
+                self.cached_dropped_memory_ages[idx] += ages_to_add
+
+        (dropped_memories, dropped_memory_ages) = outputs
+
+        with torch.no_grad():
+            dropped_memory_keys = [
+                self.model.layers[idx].self_attn.key_proj(
+                    self.model.layers[idx].input_layernorm(
+                        dropped_memories[idx].cuda() if dropped_memories[idx].device == torch.device('cpu') else dropped_memories[idx]
+                    )
+                ).detach().cpu()
+                for idx in range(self.L)
+            ]
+            
+        dropped_memories = torch.stack(dropped_memories).detach().cpu()
+        dropped_memory_keys = torch.stack(dropped_memory_keys).detach().cpu()
+
+        dropped_memories = torch.cat([dropped_memories, dropped_delta_memory], dim=1)
+        dropped_memory_keys = torch.cat([dropped_memory_keys, dropped_delta_memory_keys], dim=1)
+        dropped_memory_ages = np.concatenate([np.stack(dropped_memory_ages) + ages_to_add, dropped_delta_memory_ages], axis=1)
+
+        for idx in range(self.L):
+            self.ltm_keys[idx] = torch.cat([self.ltm_keys[idx], dropped_memory_keys[idx]])
+            self.ltm[idx] = torch.cat([self.ltm[idx], dropped_memories[idx]])
+            self.ltm_ages[idx] = np.concatenate([self.ltm_ages[idx], dropped_memory_ages[idx]])
+
+            if self.ltm[idx].shape[0] > 153600:
+                self.ltm_keys[idx] = self.ltm_keys[idx][-153600:]
+                self.ltm[idx] = self.ltm[idx][-153600:]
+                self.ltm_ages[idx] = self.ltm_ages[idx][-153600:]
+
     def update_memory_with_delta_memory(self, 
                                         delta_memory, 
                                         cached_contexts_indicators=None, 
@@ -1132,7 +1385,7 @@ class LlamaDropMemoryLTMModel(LlamaForCausalLM, BaseMemoryModel):
                                         dropped_delta_memory_ages=None):
         
         initialized = self.initialized.item()
-        
+
         if delta_memory_ages is not None and dropped_delta_memory_ages is not None:
             if dropped_delta_memory_ages.shape[1] > 0:
                 max_delta_memory_age = max(delta_memory_ages.max().item(), dropped_delta_memory_ages.max().item())
@@ -1148,7 +1401,6 @@ class LlamaDropMemoryLTMModel(LlamaForCausalLM, BaseMemoryModel):
                                     is_ltm=True, 
                                     retriever_weights=retriever_weights,
                                     delta_memory_ages=delta_memory_ages,
-                                    max_delta_memory_age=max_delta_memory_age,
                                     return_dropped_memories=(self.update_ltm_mode == 'immediate' and initialized))
 
         if initialized:
@@ -1162,8 +1414,6 @@ class LlamaDropMemoryLTMModel(LlamaForCausalLM, BaseMemoryModel):
                     self.update_ltm()
                     self.update_step = 0
             else:
-
-                # ages_to_add = 1 if delta_memory_ages is None else 1 + delta_memory_ages.max().item()
                 ages_to_add = self.num_tokens if max_delta_memory_age is None else 1 + max_delta_memory_age
 
                 for idx in range(self.L):
@@ -1181,33 +1431,80 @@ class LlamaDropMemoryLTMModel(LlamaForCausalLM, BaseMemoryModel):
                 # cat dropped_memory_ages, drop_delta_memory_ages
                 if dropped_delta_memory is not None:
                     dropped_memories = torch.cat([torch.stack(dropped_memories), dropped_delta_memory[0]], dim=1)
-                    dropped_memory_ages = torch.cat([torch.stack(dropped_memory_ages) + ages_to_add, dropped_delta_memory_ages], dim=1)
+                    dropped_memory_ages = np.concatenate([np.stack(dropped_memory_ages) + ages_to_add, dropped_delta_memory_ages], axis=1)
                 
-                else:
-                    dropped_memories = torch.stack(dropped_memories)
-                    dropped_memory_ages = torch.stack(dropped_memory_ages) + ages_to_add
-
                 # self.update_ltm(dropped_memories, dropped_memory_ages)
 
-                # Accumulate the dropped_memories and dropped_memory_ages and update for onece
+                # Accumulate the dropped_memories and dropped_memory_ages and update for once
+
+                if isinstance(dropped_memories, list):
+                    dropped_memories = torch.stack(dropped_memories)
+
                 if self.update_step == 0:
-                    self.cached_dropped_memories = dropped_memories.detach()
+
+                    with torch.no_grad():
+                        cached_dropped_keys = []
+                        for idx in range(self.L):
+                            cached_dropped_keys.append(
+                                self.model.layers[idx].self_attn.key_proj(
+                                    self.model.layers[idx].input_layernorm(
+                                        dropped_memories[idx]
+                                    )
+                                ).detach().cpu()
+                            )
+                        self.cached_dropped_keys = torch.stack(cached_dropped_keys)
+
+                    if self.put_cached_dropped_memory_on_cpu:
+                        self.cached_dropped_memories = dropped_memories.detach().cpu()
+                    else:
+                        self.cached_dropped_memories = dropped_memories.detach()
+
                     self.cached_dropped_memory_ages = dropped_memory_ages
 
                 else:
-                    self.cached_dropped_memories = torch.cat([
-                        self.cached_dropped_memories, 
-                        dropped_memories.detach()
-                    ], dim=1)
-                    self.cached_dropped_memory_ages = torch.cat([
-                        self.cached_dropped_memory_ages + ages_to_add,
+                    
+                    with torch.no_grad():
+                        cached_dropped_keys = []
+                        for idx in range(self.L):
+                            cached_dropped_keys.append(
+                                self.model.layers[idx].self_attn.key_proj(
+                                    self.model.layers[idx].input_layernorm(
+                                        dropped_memories[idx]
+                                    )
+                                ).detach().cpu()
+                            )
+                        cached_dropped_keys = torch.stack(cached_dropped_keys)
+                        self.cached_dropped_keys = torch.cat([
+                            self.cached_dropped_keys,
+                            cached_dropped_keys
+                        ], dim=1)
+
+                    # empty torch memory cache
+                    torch.cuda.empty_cache()
+
+                    if self.put_cached_dropped_memory_on_cpu:
+                        self.cached_dropped_memories = torch.cat([
+                            self.cached_dropped_memories, 
+                            dropped_memories.detach().cpu()
+                        ], dim=1)
+                    else:
+                        self.cached_dropped_memories = torch.cat([
+                            self.cached_dropped_memories, 
+                            dropped_memories.detach()
+                        ], dim=1)
+                    
+                    self.cached_dropped_memory_ages = np.concatenate([
+                        self.cached_dropped_memory_ages,
                         dropped_memory_ages
-                    ], dim=1)
+                    ], axis=1)
 
                 self.update_step += ages_to_add
 
                 if self.update_step >= self.update_ltm_frequency * self.num_tokens:
-                    self.update_ltm(self.cached_dropped_memories, self.cached_dropped_memory_ages)
+                    self.update_ltm(self.cached_dropped_memories, 
+                                    self.cached_dropped_memory_ages,
+                                    device=delta_memory.device if self.put_cached_dropped_memory_on_cpu else None,
+                                    cached_dropped_keys=self.cached_dropped_keys)
                     self.update_step = 0
                     self.cached_dropped_memories, self.cached_dropped_memory_ages = None, None
 
@@ -1227,9 +1524,13 @@ class LlamaDropMemoryLTMModel(LlamaForCausalLM, BaseMemoryModel):
     
         stm = self.get_stm(idx, hidden_states, delta_memory, is_injection, cat_to_maximum_memory)
 
+        if stm.device != hidden_states.device:
+            stm = stm.to(hidden_states.device)
+
         ltm_indices = None
 
         if (not is_injection) and (delta_memory is None or cat_to_maximum_memory):
+            
             ltm, ltm_indices = self.get_ltm(idx, hidden_states, random_retriever_length=random_retriever_length)
             hidden_states = torch.cat([
                 ltm.unsqueeze(0),
@@ -1464,9 +1765,9 @@ class LlamaDropMemoryLTMModel(LlamaForCausalLM, BaseMemoryModel):
             if output_delta_memory:
                 all_delta_memory.append(hidden_states[:, -self.num_tokens:])
 
-                if self.initialized:
-                    # check if the memory is recalled by the hidden_states
-                    self.update_recall_frequency(idx, hidden_states)
+                # if self.initialized:
+                #     # recall part of the memory according to the hidden states
+                #     self.update_recall_frequency(idx, hidden_states)
 
             hidden_states = hidden_states[:, -input_ids.shape[1]:]
 
@@ -1512,7 +1813,10 @@ class LlamaDropMemoryLTMModel(LlamaForCausalLM, BaseMemoryModel):
             logits = [F.linear(hidden_states, lm_head_slices[i]) for i in range(self.config.pretraining_tp)]
             logits = torch.cat(logits, dim=-1)
         else:
-            logits = self.lm_head(hidden_states)
+            if self.skip_logits_except_the_last_hidden_state:
+                logits = self.lm_head(hidden_states[:, -1:])
+            else:
+                logits = self.lm_head(hidden_states)
         logits = logits.float()
 
         loss = None

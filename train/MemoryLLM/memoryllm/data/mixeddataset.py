@@ -143,17 +143,13 @@ class MixedDataset(Dataset):
         self.documents = []
         for key, count in self.long_documents_counts.items():
             with open(output_sampled_files[key], 'r') as f:
-
-
                 # Use islice to read only the first 'count' lines
                 # for line in islice(f, count):
                 #     self.documents.append(json.loads(line)['text']
                 # )
-
-                # from count * (end / (end - start)) - count to count * (end / (end - start))
-                for line in islice(f, int(count * (short_document_end / (short_document_end - short_document_start))) - count, count):
-                    self.documents.append(json.loads(line)['text']
-                )
+                for line in islice(f, int(count * (short_document_end / (short_document_end - short_document_start))) - count, 
+                                   int(count * (short_document_end / (short_document_end - short_document_start)))):
+                    self.documents.append(json.loads(line)['text'])
 
         end_time = time.time()
         print("Reading long documents took:", end_time - start_time)

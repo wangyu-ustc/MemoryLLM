@@ -1,22 +1,36 @@
+import os
 import argparse, os, sys, datetime, glob, importlib, csv
 import numpy as np
 import time
 import copy
 import torch
+from tqdm import tqdm
+import deepspeed
 import pytorch_lightning as pl
 from collections import OrderedDict
 from packaging import version
 from omegaconf import OmegaConf
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import random_split, DataLoader, Dataset, Subset
 from functools import partial
 
 from pytorch_lightning import seed_everything
 from pytorch_lightning.trainer import Trainer
 from pytorch_lightning.callbacks import ModelCheckpoint, Callback, LearningRateMonitor
+from pytorch_lightning.utilities.rank_zero import rank_zero_only
 from pytorch_lightning.utilities import rank_zero_info
+# from pytorch_lightning.plugins import DDPPlugin
+from pytorch_lightning.strategies.ddp import DDPStrategy
 from torch.utils.data import IterableDataset
 
 from MemoryLLM.memoryllm.util import instantiate_from_config, collate_fn_qa
+
+os.environ["WANDB_CONFIG_DIR"] = os.path.join(os.getcwd (),"tmp")
+os.makedirs(os.path.join(os.getcwd(), "tmp"), exist_ok=True)
+os.makedirs(os.path.join(os.getcwd(), "wandb"), exist_ok=True)
+
+import wandb
+wandb.login(key="your_wandb_key")
+
 
 def get_parser(**parser_kwargs):
     def str2bool(v):
@@ -168,6 +182,18 @@ def worker_init_fn(_):
     worker_id = worker_info.id
     return np.random.seed(np.random.get_state()[1][0] + worker_id)
 
+def worker_init_fn_mixed(worker_id):
+    worker_info = torch.utils.data.get_worker_info()
+    dataset = worker_info.dataset # the dataset copy in this worker process
+    dataset.set_worker(worker_id, worker_info.num_workers)
+
+def worker_init_fn_ift(worker_id):
+    worker_info = torch.utils.data.get_worker_info()
+    dataset = worker_info.dataset
+    all_dataset = len(dataset.redpajama_dataset.all_paths)
+    per_worker = all_dataset // worker_info.num_workers
+    dataset.redpajama_dataset.all_paths = dataset.redpajama_dataset.all_paths[worker_id * per_worker: (worker_id + 1) * per_worker]
+
 def worker_init_fn_redpajama(worker_id):
     worker_info = torch.utils.data.get_worker_info()
     dataset = worker_info.dataset # the dataset copy in this worker process
@@ -180,7 +206,7 @@ class DataModuleFromConfig(pl.LightningDataModule):
                  train=None, validation=None, test=None, predict=None, wrap=False, num_workers=None, 
                  shuffle_test_loader=False, use_worker_init_fn=False, mask_strategy=None, mask_ratio=0.0,
                  shuffle_val_dataloader=False, pad_to_max_length=False, add_mask_token=False, add_pad_token=False, 
-                 add_memory_token=False, collate_fn='none', worker_init_fn="worker_init_fn_redpajama"):
+                 add_memory_token=False, collate_fn='none', worker_init_fn="worker_init_fn_redpajama", is_ift=False):
         super().__init__()
         self.batch_size = batch_size
         self.num_tokens = num_tokens
@@ -201,6 +227,7 @@ class DataModuleFromConfig(pl.LightningDataModule):
         # TODO: not sure if max_length can be accessed
         self.eval_max_length = self.datasets['train'].max_length if eval_max_length is None else eval_max_length
         self.collate_fn = collate_fn
+        self.is_ift = is_ift
 
         if train is not None:
             self.dataset_configs["train"] = train
@@ -306,17 +333,26 @@ class DataModuleFromConfig(pl.LightningDataModule):
             num_tokens=self.num_tokens,
             padding='max_length' if self.pad_to_max_length else 'longest',
             add_special_tokens=self.add_special_tokens,
-            end_special_token=self.end_special_token)
+            end_special_token=self.end_special_token,
+            is_ift=self.is_ift)
 
         if isinstance(self.datasets["validation"], list):            
             dataloaders = []
             for dataset in self.datasets['validation']:
-                dataloaders.append(
-                    DataLoader(dataset, batch_size=self.eval_batch_size,
-                            num_workers=self.num_workers,
-                            worker_init_fn=init_fn,
-                            shuffle=shuffle, collate_fn=collate_fn_with_params),
-                )
+                if dataset.type == 'cqa':
+                    dataloaders.append(
+                        DataLoader(dataset, batch_size=self.eval_batch_size,
+                                num_workers=self.num_workers,
+                                worker_init_fn=init_fn,
+                                shuffle=shuffle, collate_fn=collate_fn_with_params),
+                    )
+                else:
+                    dataloaders.append(
+                        DataLoader(dataset, batch_size=self.eval_batch_size,
+                                num_workers=self.num_workers,
+                                worker_init_fn=init_fn,
+                                shuffle=shuffle),
+                    )
 
             return dataloaders
 
@@ -420,6 +456,47 @@ class CUDACallback(Callback):
 
 
 if __name__ == '__main__':
+    # torch.autograd.set_detect_anomaly(True)
+    # custom parser to specify config files, train, test and debug mode,
+    # postfix, resume.
+    # `--key value` arguments are interpreted as arguments to the trainer.
+    # `nested.key=value` arguments are interpreted as config parameters.
+    # configs are merged from left-to-right followed by command line parameters.
+
+    # model:
+    #   base_learning_rate: float
+    #   target: path to lightning module
+    #   params:
+    #       key: value
+    # data:
+    #   target: main.DataModuleFromConfig
+    #   params:
+    #      batch_size: int
+    #      wrap: bool
+    #      train:
+    #          target: path to train dataset
+    #          params:
+    #              key: value
+    #      validation:
+    #          target: path to validation dataset
+    #          params:
+    #              key: value
+    #      test:
+    #          target: path to test dataset
+    #          params:
+    #              key: value
+    # lightning: (optional, has sane defaults and can be specified on cmdline)
+    #   trainer:
+    #       additional arguments to trainer
+    #   logger:
+    #       logger to instantiate
+    #   modelcheckpoint:
+    #       modelcheckpoint to instantiate
+    #   callbacks:
+    #       callback1:
+    #           target: importpath
+    #           params:
+    #               key: value
 
     now = datetime.datetime.now().strftime("%Y-%m-%dT%H-%M-%S")
     # add cwd for convenience and to make classes in this file available when
@@ -428,6 +505,9 @@ if __name__ == '__main__':
     sys.path.append(os.getcwd())
 
     parser = get_parser()
+
+    # 1.9.0:
+    # parser = Trainer.add_argparse_args(parser)
 
     opt, unknown = parser.parse_known_args()
     if opt.name and opt.resume:
@@ -563,11 +643,13 @@ if __name__ == '__main__':
         # trainer and callbacks
         trainer_kwargs = dict()
 
+        os.makedirs(logdir, exist_ok=True)
         # default logger configs
         default_logger_cfgs = {
             "wandb": {
                 "target": "pytorch_lightning.loggers.WandbLogger",
                 "params": {
+                    "project": "MemoryLLM",
                     "name": nowname,
                     "save_dir": logdir,
                     "offline": opt.debug,
@@ -582,7 +664,10 @@ if __name__ == '__main__':
                 }
             },
         }
-        default_logger_cfg = default_logger_cfgs["testtube"]
+        if "debug" in opt.base[0]:
+            default_logger_cfg = default_logger_cfgs["testtube"]
+        else:
+            default_logger_cfg = default_logger_cfgs["wandb"]
         if "logger" in lightning_config:
             logger_cfg = lightning_config.logger
         else:
@@ -593,19 +678,25 @@ if __name__ == '__main__':
         # modelcheckpoint - use TrainResult/EvalResult(checkpoint_on=metric) to
         # specify which metric is used to determine best models
         default_modelckpt_cfg = {
-            "target": "pytorch_lightning.callbacks.ModelCheckpoint",
+            # "target": "pytorch_lightning.callbacks.ModelCheckpoint",
+            "target": 'MemoryLLM.memoryllm.util.ModelCheckpointLLM',
             "params": {
                 "dirpath": ckptdir,
-                "filename": "{epoch:06}",
+                "filename": "{step:09}",
                 "verbose": True,
                 "save_last": True,
+                # "every_n_train_steps": 10
             }
         }
+
         if hasattr(model, "monitor"):
             print(f"Monitoring {model.monitor} as checkpoint metric.")
             default_modelckpt_cfg["params"]["monitor"] = model.monitor
             default_modelckpt_cfg["params"]["save_top_k"] = 3
-            default_modelckpt_cfg["params"]["mode"] = "max"
+            if 'acc' in model.monitor:
+                default_modelckpt_cfg["params"]["mode"] = "max"
+            else:
+                default_modelckpt_cfg["params"]["mode"] = "min"
 
         if "modelcheckpoint" in lightning_config:
             modelckpt_cfg = lightning_config.modelcheckpoint
@@ -664,7 +755,7 @@ if __name__ == '__main__':
                             'save_top_k': -1,
                             'every_n_train_steps': opt.n_train_steps,
                             'save_weights_only': True
-                     }
+                        }
                      }
             }
             default_callbacks_cfg.update(default_metrics_over_trainsteps_ckpt_dict)
@@ -684,6 +775,23 @@ if __name__ == '__main__':
         # trainer_kwargs.update({
         #     'strategy': DDPStrategy(find_unused_parameters=False)
         # })
+
+        if trainer_kwargs['strategy'] == 'fsdp':
+
+            # fsdp_configs = dict(trainer_kwargs['fsdp_configs'])
+            # del trainer_kwargs['fsdp_configs']
+
+            from pytorch_lightning.strategies import FSDPStrategy
+            # from customized_fsdp_strategy import FSDPStrategy
+            # if 'ignored_modules' in fsdp_configs:
+            #     from MemoryLLM.memoryllm.modules.memory_llama import MemoryModule
+            #     fsdp_configs['ignored_modules'] = [MemoryModule]
+            from torch.distributed.fsdp import MixedPrecision
+
+            trainer_kwargs['strategy'] = FSDPStrategy(
+                mixed_precision=MixedPrecision(param_dtype=torch.float16, cast_forward_inputs=True),
+                cpu_offload=True)
+
         trainer = Trainer(**trainer_kwargs)
         
         trainer.logdir = logdir  ###
@@ -697,6 +805,37 @@ if __name__ == '__main__':
         # data.prepare_data()
 
         data.setup()
+
+        # print("#### Data #####")
+        # for k in data.datasets:
+        #     print(f"{k}, {data.datasets[k].__class__.__name__}, {len(data.datasets[k])}")
+
+        # ########### dataloader statistics: ######################
+        # context_lengths = []
+        # sequence_lengths = []
+        # for idx, batch in tqdm(enumerate(data.train_dataloader().loader1), total=1000):
+        #     context, context_mask, sequence, sequence_mask, _ = batch
+        #     context_lengths.extend(context_mask.sum(dim=1).tolist())
+        #     sequence_lengths.extend(sequence_mask.sum(dim=1).tolist())
+        #     if idx > 1000:
+        #         break
+        
+        # # print the maximum, minimum, std, average of the lengths:
+        # print("Context:")
+        # print(max(context_lengths))
+        # print(min(context_lengths))
+        # print(np.mean(context_lengths))
+        # print(np.std(context_lengths))
+
+        # print("Sequence:")
+        # print(max(sequence_lengths))
+        # print(min(sequence_lengths))
+        # print(np.mean(sequence_lengths))
+        # print(np.std(sequence_lengths))
+        # #######################################################
+
+        # set the dataset to be one attribute of the model
+        # model.train_dataset = data.datasets['train'].data
 
         # configure learning rate
         bs, base_lr = config.data.params.batch_size, config.model.base_learning_rate
@@ -726,23 +865,24 @@ if __name__ == '__main__':
         # allow checkpointing via USR1
         def melk(*args, **kwargs):
             # run all checkpoint hooks
-            if trainer.global_rank == 0:
-                print("Summoning checkpoint.")
-                ckpt_path = os.path.join(ckptdir, "last.ckpt")
-                if hasattr(trainer.model, "save_pretrained"):
-                    trainer.model.save_pretrained(ckpt_path)
-                elif hasattr(trainer.model, "model") and hasattr(trainer.model.model, "save_pretrained"):
-                    trainer.model.model.save_pretrained(ckpt_path)
-                elif hasattr(trainer, "save_checkpoint"):
-                    trainer.save_checkpoint(ckpt_path)
-                else:
-                    print("Skipping save ckpt")
-                print(f"Checkpoint saved to {ckpt_path}")
+            # if trainer.global_rank == 0:
+            #     print("Summoning checkpoint.")
+            #     ckpt_path = os.path.join(ckptdir, "last.ckpt")
+            #     if hasattr(trainer.model, "save_pretrained"):
+            #         trainer.model.save_pretrained(ckpt_path)
+            #     elif hasattr(trainer.model, "model") and hasattr(trainer.model.model, "save_pretrained"):
+            #         trainer.model.model.save_pretrained(ckpt_path)
+            #     elif hasattr(trainer, "save_checkpoint"):
+            #         trainer.save_checkpoint(ckpt_path)
+            #     else:
+            #         print("Skipping save ckpt")
+            #     print(f"Checkpoint saved to {ckpt_path}")
+            pass
             
         def divein(*args, **kwargs):
             if trainer.global_rank == 0:
-                import ipdb;
-                ipdb.set_trace()
+                import pudb;
+                pudb.set_trace()
 
 
         import signal

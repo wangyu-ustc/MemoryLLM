@@ -2,16 +2,16 @@ import os
 import sys
 import time
 import torch
+import warnings
 import numpy as np
 import pytorch_lightning as pl
 from MemoryLLM.memoryllm.util import calculate_exact_hit_accuracy, calculate_qa_f1_score
 from MemoryLLM.memoryllm.modules.scheduler import LinearDecayScheduler
-from collections import OrderedDict
 from MemoryLLM.memoryllm.util import instantiate_from_config
 import torch.nn.functional as F
 from sklearn import metrics
-
 from transformers.utils import logging
+from MemoryLLM.memoryllm.util import get_num_tokens
 
 logger = logging.get_logger(__name__)
 
@@ -19,6 +19,7 @@ class BaseMemoryModelPL(pl.LightningModule):
     def __init__(self, 
                  monitor=None,
                  optimizer=None,
+                 lr_scheduler=None,
                  validation_dataset_names=None,
                  cat_memories=False,
                  cat_and_drop_memory=False,
@@ -56,6 +57,8 @@ class BaseMemoryModelPL(pl.LightningModule):
                  half_last=False,
                  num_of_additional_tokens_to_mask=0,
                  full_context_and_sentence_training_ratio=0.0,
+                 complete_with_random_memory_insertion_ratio=0.0,
+                 random_insertion_max_length=4,
                  retriever_penalty_weight=0.01,
                  add_penalty_on_retriever_weights=False,
                  pretraining_selector_steps=0,
@@ -72,9 +75,17 @@ class BaseMemoryModelPL(pl.LightningModule):
                  add_encoder_retriever=False,
                  use_retriever_when_dropping_from=None,
                  use_retriever_during_validation=True,
+                 train_retriever_on_important_tokens=False,
+                 train_with_random_memory_insertion_ratio=0.0,
+                 keep_gradient_in_random_insertion=True,
+                 efficient_get_delta_memory=False,
+                 random_length_for_encoder=True,
                  parallel_injection=False,
                  parallel_chunk_size=None,
-                 train_retriever_on_important_tokens=False):
+                 scale_randomized_poe_ratio=None,
+                 scale_randomized_poe_ratio_for_memory=None,
+                 randomized_poe_ratio=None,
+                 randomized_poe_for_memory_ratio=None):
 
         super(BaseMemoryModelPL, self).__init__()
     
@@ -82,6 +93,7 @@ class BaseMemoryModelPL(pl.LightningModule):
             self.monitor = monitor
 
         self.optimizer = optimizer
+        self.lr_scheduler = lr_scheduler
         self.backup_memory_when_validating = backup_memory_when_validating
         self.new_context_number_ratio = new_context_number_ratio
         self.validation_dataset_names = validation_dataset_names
@@ -122,6 +134,20 @@ class BaseMemoryModelPL(pl.LightningModule):
         self.eager_update_memory = eager_update_memory
         self.parallel_injection = parallel_injection
         self.parallel_chunk_size = parallel_chunk_size
+        self.train_retriever_on_important_tokens = train_retriever_on_important_tokens
+        self.train_with_random_memory_insertion_ratio = train_with_random_memory_insertion_ratio
+        self.complete_with_random_memory_insertion_ratio = complete_with_random_memory_insertion_ratio
+        self.random_insertion_max_length = random_insertion_max_length
+        self.efficient_get_delta_memory = efficient_get_delta_memory
+        self.keep_gradient_in_random_insertion = keep_gradient_in_random_insertion
+        self.random_length_for_encoder = random_length_for_encoder
+
+        # configs for scaling up the model
+        self.scale_randomized_poe_ratio = scale_randomized_poe_ratio
+        self.scale_randomized_poe_ratio_for_memory = scale_randomized_poe_ratio_for_memory
+        self.randomized_poe_ratio = randomized_poe_ratio
+        self.randomized_poe_for_memory_ratio =randomized_poe_for_memory_ratio
+
         self.val_injection_steps_per_eval = 40
 
         # configurations about retriever weights
@@ -136,7 +162,6 @@ class BaseMemoryModelPL(pl.LightningModule):
         self.add_encoder_retriever = add_encoder_retriever
         self.use_retriever_when_dropping_from = use_retriever_when_dropping_from
         self.use_retriever_during_validation = use_retriever_during_validation
-        self.train_retriever_on_important_tokens = train_retriever_on_important_tokens
 
         if adjust_weight_strategy is not None:
             self.adjust_weight_strategy = instantiate_from_config(adjust_weight_strategy)
@@ -206,8 +231,7 @@ class BaseMemoryModelPL(pl.LightningModule):
         else:
             return self.adjust_weight_strategy.get_weight()
     
-    def ift_training_step(self, batch, batch_idx):
-        pass
+    # def ift_training_step(self, batch, batch_idx):
 
     # commented for now as I constantly take ift_training_step as training_step
     # def ift_training_step(self, batch, batch_idx):
@@ -215,9 +239,6 @@ class BaseMemoryModelPL(pl.LightningModule):
     #     contexts_ids, sentence_ids, sentence_labels, label = batch
 
     #     delta_memory = None
-
-    #     # now we don't consider detaching the memory
-    #     # TODO: add instruction tuning with memory detached
 
     #     skip_injection = False
     #     if self.cache_data_for_longer_context:
@@ -252,7 +273,7 @@ class BaseMemoryModelPL(pl.LightningModule):
     #             all_delta_memory = None
     #             delta_memory = None
 
-    #             context_indices = torch.arange(len(contexts_ids))
+    #             context_indices = np.arange(len(contexts_ids))
 
     #             for i in context_indices:
 
@@ -441,6 +462,10 @@ class BaseMemoryModelPL(pl.LightningModule):
 
     def get_selector_loss(self, retriever_weights, retriever_weights_labels, label):
 
+        if self.train_retriever_on_important_tokens:
+            retriever_weights_labels = retriever_weights_labels[:, self.model.importance_indicators]
+            retriever_weights = retriever_weights[:, torch.where(self.model.importance_indicators)[0]]
+
         if self.selector_loss_type == 'bce':
             positive_indices = torch.where(retriever_weights_labels > 0.5)
             negative_indices = torch.where(retriever_weights_labels < 0.5)
@@ -508,7 +533,7 @@ class BaseMemoryModelPL(pl.LightningModule):
                 if retriever_weights_labels[idx].sum() == 0:
                     f1 = 0
                 else:
-                    f1 = metrics.f1_score(retriever_weights_labels[idx].reshape(-1).cpu().numpy(), (retriever_weights[idx] > 0.5).reshape(-1).cpu().numpy())
+                    f1 = metrics.f1_score(retriever_weights_labels[idx].detach().to(torch.float16).reshape(-1).cpu().numpy(), (retriever_weights[idx].detach().reshape(-1).to(torch.float16).cpu().numpy() > 0.5))
                 
                 if self.selector_layers is None:
                     self.log_dict({f"selector_per_layer/{label}f1_{idx}": f1}, logger=True, on_step=True)
@@ -516,7 +541,7 @@ class BaseMemoryModelPL(pl.LightningModule):
                     self.log_dict({f"selector_per_layer/{label}f1_{self.selector_layers[idx]}": f1}, logger=True, on_step=True)
         
         if retriever_weights_labels.sum() > 0:
-            f1_all = metrics.f1_score(retriever_weights_labels.reshape(-1).cpu().numpy(), (retriever_weights > 0.5).reshape(-1).cpu().numpy())
+            f1_all = metrics.f1_score(retriever_weights_labels.to(torch.float16).reshape(-1).detach().cpu().numpy(), (retriever_weights.to(torch.float16).detach() > 0.5).reshape(-1).cpu().numpy())
         else:
             f1_all = 0
         self.log_dict({f"selector/{label}f1_all": f1_all}, logger=True, on_step=True)
@@ -526,56 +551,46 @@ class BaseMemoryModelPL(pl.LightningModule):
                                         contexts_ids, 
                                         sentence_ids, 
                                         labels,
-                                        cat_to_maximum_memory):
+                                        cat_to_maximum_memory,
+                                        sentence_start_idx=None):
 
-        if self.num_contexts_schedule is not None:
+        with torch.no_grad():
 
-            if not cat_to_maximum_memory:
-                num_of_contexts = 1
-            else:
-                if np.random.random() < self.one_context_ratio:
+            sentence_labels = None
+
+            if self.num_contexts_schedule is not None:
+
+                if not cat_to_maximum_memory:
                     num_of_contexts = 1
                 else:
                     num_of_contexts = self.num_contexts(self.trainer.global_step)
 
-            # log self.one_context_ratio
-            self.log_dict({'one_context_ratio': self.one_context_ratio}, logger=True, on_step=True)
-
-            if np.random.random() < self.random_sample_length_ratio:
-                num_of_contexts = min(np.random.randint(1, num_of_contexts+1), len(contexts_ids))
-            else:
-                num_of_contexts = min(num_of_contexts, len(contexts_ids))
-
-            if labels[0] == 0:
-                # cut the end of the contexts    
-                contexts_ids = contexts_ids[:num_of_contexts]
-            elif labels[0] == 1:
-                # cut the beginning of the contexts
-                contexts_ids = contexts_ids[-num_of_contexts:]
-            elif labels[0] == 2:
-                # it means the sentence is the second part of the contexts
-                if num_of_contexts == 1 and len(contexts_ids) > 1:
-                    contexts_ids = contexts_ids[1:][:num_of_contexts]
+                if np.random.random() < self.random_sample_length_ratio:
+                    num_of_contexts = min(np.random.randint(1, num_of_contexts+1), len(contexts_ids))
                 else:
+                    num_of_contexts = min(num_of_contexts, len(contexts_ids))
+
+                if labels[0] == 0:
+                    # cut the end of the contexts    
                     contexts_ids = contexts_ids[:num_of_contexts]
-            elif labels[0] == 3:
-                contexts_ids = contexts_ids[:num_of_contexts]
-
-            elif labels[0] == 4:
-
-                # target is context during completion task training
-                # cut the end of the contexts:
-                contexts_ids = contexts_ids[:num_of_contexts]
-
-                if not self.is_pretrain_ift:
-                    
-                    if self.half_last:
-                        if np.random.random() < 0.5:
-                            sentence_ids = torch.cat(contexts_ids, dim=1)[:, -self.max_seq_length:]
-                        else:
-                            sentence_ids = torch.cat(contexts_ids, dim=1)[:, :self.max_seq_length]
+                elif labels[0] == 1:
+                    # cut the beginning of the contexts
+                    contexts_ids = contexts_ids[-num_of_contexts:]
+                elif labels[0] == 2:
+                    # it means the sentence is the second part of the contexts
+                    if num_of_contexts == 1 and len(contexts_ids) > 1:
+                        contexts_ids = contexts_ids[1:][:num_of_contexts]
                     else:
-                        sentence_ids = torch.cat(contexts_ids, dim=1)[:, :self.max_seq_length]
+                        contexts_ids = contexts_ids[:num_of_contexts]
+                elif labels[0] == 3:
+                    contexts_ids = contexts_ids[:num_of_contexts]
+
+                elif labels[0] == 4:
+
+                    # target is context during completion task training
+                    contexts_ids = contexts_ids[:num_of_contexts]
+
+                    sentence_ids = torch.cat(contexts_ids, dim=1)[:, :self.max_seq_length]
 
                     if self.instruct is not None:
                         sentence = self.instruct.strip() + " " + self.tokenizer.decode(sentence_ids[0], skip_special_tokens=True)
@@ -587,49 +602,145 @@ class BaseMemoryModelPL(pl.LightningModule):
                         sentence_labels = sentence_ids.clone()
                         if self.mask_instruction_tokens:
                             sentence_labels[:, :len(self.tokenizer(self.instruct.strip(),
-                                                                   add_special_tokens=False).input_ids) + self.num_of_additional_tokens_to_mask] = -100
+                                                                    add_special_tokens=False).input_ids) + self.num_of_additional_tokens_to_mask] = -100
                     else:
                         sentence_labels = sentence_ids.clone()
 
-            else:
-                raise ValueError("Invalid label")
-        
-        return contexts_ids, sentence_ids
+                else:
+                    raise ValueError("Invalid label")
+            
+            if sentence_labels is None:
+                sentence_labels = sentence_ids.clone()
 
-    def log_loss(self, labels, cat_to_maximum_memory, num_of_contexts, loss):
+        contexts_ids = [x.detach() for x in contexts_ids]
+        sentence_ids = sentence_ids.detach()
+        sentence_labels = sentence_labels.detach()
+
+        return contexts_ids, sentence_ids, sentence_labels
+
+    def log_loss(self, labels, cat_to_maximum_memory, num_of_contexts, loss, random_position=False):
+
+        random_position_str = '_random' if random_position else ''
 
         if labels[0] == 3 or labels[0] == 4:
             if cat_to_maximum_memory:
                 if num_of_contexts < 5:
-                    self.log_dict({'repeat/c_with_memory_{}'.format(num_of_contexts): loss}, logger=True, on_step=True)
+                    self.log_dict({'repeat/c_with_memory_{}_{}'.format(random_position_str, num_of_contexts): loss}, logger=True, on_step=True)
                 elif num_of_contexts < 10:
-                    self.log_dict({'repeat/c_with_memory_5_to_10': loss}, logger=True, on_step=True)
+                    self.log_dict({'repeat/c_with_memory_5_to_10_{}'.format(random_position_str): loss}, logger=True, on_step=True)
                 elif num_of_contexts < 15:
-                    self.log_dict({'repeat/c_with_memory_10_to_15': loss}, logger=True, on_step=True)
+                    self.log_dict({'repeat/c_with_memory_10_to_15_{}'.format(random_position_str): loss}, logger=True, on_step=True)
                 elif num_of_contexts < 20:
-                    self.log_dict({'repeat/c_with_memory_15_to_20': loss}, logger=True, on_step=True)
+                    self.log_dict({'repeat/c_with_memory_15_to_20_{}'.format(random_position_str): loss}, logger=True, on_step=True)
                 else:
-                    self.log_dict({'repeat/c_with_memory_20_plus': loss}, logger=True, on_step=True)
+                    self.log_dict({'repeat/c_with_memory_20_plus_{}'.format(random_position_str): loss}, logger=True, on_step=True)
 
             else:
                 self.log_dict({'repeat/c_{}'.format(num_of_contexts): loss}, logger=True, on_step=True)
         
         else:
             # if num_of_contexts == 1:
+            
             if cat_to_maximum_memory:
                 if num_of_contexts < 5:
-                    self.log_dict({'loss/related_c_with_memory_{}'.format(num_of_contexts): loss}, logger=True, on_step=True)
+                    self.log_dict({'loss/related_c_with_memory_{}_{}'.format(random_position_str, num_of_contexts): loss}, logger=True, on_step=True)
                 elif num_of_contexts < 10:
-                    self.log_dict({'loss/related_c_with_memory_5_to_10': loss}, logger=True, on_step=True)
+                    self.log_dict({'loss/related_c_with_memory_5_to_10_{}'.format(random_position_str): loss}, logger=True, on_step=True)
                 elif num_of_contexts < 15:
-                    self.log_dict({'loss/related_c_with_memory_10_to_15': loss}, logger=True, on_step=True)
+                    self.log_dict({'loss/related_c_with_memory_10_to_15_{}'.format(random_position_str): loss}, logger=True, on_step=True)
                 elif num_of_contexts < 20:
-                    self.log_dict({'loss/related_c_with_memory_15_to_20': loss}, logger=True, on_step=True)
+                    self.log_dict({'loss/related_c_with_memory_15_to_20_{}'.format(random_position_str): loss}, logger=True, on_step=True)
                 else:
-                    self.log_dict({'loss/related_c_with_memory_20_plus': loss}, logger=True, on_step=True)
+                    self.log_dict({'loss/related_c_with_memory_20_plus_{}'.format(random_position_str): loss}, logger=True, on_step=True)
                     
             else:
                 self.log_dict({'loss/related_c_{}'.format(num_of_contexts): loss}, logger=True, on_step=True)
+
+    def debug_recording_time(self, contexts_ids):
+
+        if len(contexts_ids) > 20:
+            # time 1:
+            # start_time = time.time()
+            # all_delta_memory = self.parallel_process_contexts(contexts_ids)
+            # end_time = time.time()
+            # print("Time for parallel_process_contexts: ", end_time - start_time)
+
+            start_time = time.time()
+            with torch.no_grad():
+                delta_memory = None
+                for context_idx, context_ids in enumerate(contexts_ids):
+                    delta_memory = self.model(input_ids=context_ids,
+                                output_delta_memory=True,
+                                is_injection=True,
+                                delta_memory=delta_memory,
+                                training=True).delta_memory
+            end_time = time.time()
+            print("Time for sequential_process_contexts without gradient: ", end_time - start_time)
+
+            start_time = time.time()
+            delta_memory = None
+            for context_idx, context_ids in enumerate(contexts_ids):
+                delta_memory = self.model(input_ids=context_ids,
+                            output_delta_memory=True,
+                            is_injection=True,
+                            delta_memory=delta_memory,
+                            training=True).delta_memory.detach()
+            end_time = time.time()
+            print("Time for sequential_process_contexts with gradient: ", end_time - start_time)
+
+            # start_time = time.time()
+            # with torch.no_grad():
+            #     for context_idx, context_ids in enumerate(contexts_ids):
+
+            #         if self.parallel_injection:
+            #             delta_memory = all_delta_memory[context_idx]
+            #         else:
+            #             output = self.model(input_ids=context_ids,
+            #                                 output_delta_memory=True,
+            #                                 delta_memory=delta_memory,
+            #                                 is_injection=True,
+            #                                 training=True)
+            #             delta_memory = output.delta_memory.detach()
+
+            #         with torch.no_grad():
+            #             # get retriever weights
+            #             all_retriever_weights = []
+            #             for idx in range(self.model.memory.shape[0]):
+            #                 delta_memory_queries = self.model.model.model.layers[idx].self_attn.encoder_query_proj(
+            #                     self.model.model.model.layers[idx].input_layernorm(delta_memory[0, idx]))
+            #                 if self.model.maintain_memory_keys:
+            #                     memory_keys = self.model.memory_keys[idx]
+            #                 else:
+            #                     memory_keys = self.model.model.model.layers[idx].self_attn.key_proj(
+            #                         self.model.model.model.layers[idx].input_layernorm(self.model.memory[idx]))
+            #                 retriever_weights = (delta_memory_queries @ memory_keys.transpose(-2, -1)).sigmoid().mean(dim=0)
+            #                 all_retriever_weights.append(retriever_weights)
+            #             retriever_weights = torch.stack(all_retriever_weights)
+            #         retriever_weights = retriever_weights.detach()
+
+            #         if context_idx == 0:
+            #             self.cached_contexts_indicators = self.model.update_memory_with_delta_memory(delta_memory, self.cached_contexts_indicators,
+            #                                                                                         retriever_weights=retriever_weights)
+            #             retriever_weights_labels = torch.ones([self.model.memory.shape[0], self.model.memory.shape[1]], dtype=delta_memory.dtype, device=delta_memory.device)
+            #             retriever_weights_labels[:, - self.model.num_tokens:] = 0
+                        
+            #         else:
+            #             contexts_indicators = self.model.update_memory_with_delta_memory(delta_memory, torch.stack([self.cached_contexts_indicators, retriever_weights_labels.to(self.cached_contexts_indicators.device)]),
+            #                                                                                         retriever_weights=retriever_weights)
+            #             self.cached_contexts_indicators = contexts_indicators[0]
+            #             retriever_weights_labels = contexts_indicators[1]
+
+            #     retriever_weights_labels = 1 - retriever_weights_labels
+            #     delta_memory = None
+            # end_time = time.time()
+            # print("Time for eager_update_memory:", end_time - start_time)
+
+            start_time = time.time()
+            self.inject_contexts_ids_into_memory(contexts_ids, False)
+            end_time = time.time()
+            print("time for injecting contexts_ids:", end_time - start_time)
+
+            import ipdb; ipdb.set_trace()
 
     def parallel_process_contexts(self, contexts_ids):
 
@@ -798,59 +909,138 @@ class BaseMemoryModelPL(pl.LightningModule):
                 
                 else:
 
-                    delta_memory = None
-                    # initialize dropped_delta_memory and dropped_delta_memory_ages
-                    dropped_delta_memory, dropped_delta_memory_ages = None, None
+                    if self.efficient_get_delta_memory:
 
-                    for context_idx, context_ids in enumerate(contexts_ids):
-
-                        output = self.model(input_ids=context_ids,
-                                        output_delta_memory=True,
-                                        delta_memory=delta_memory,
-                                        is_injection=True,
-                                        training=True)
-                        delta_memory = output.delta_memory
-
-                        # if hasattr(self.model, "remaining_indicators"):
-                        #     raise NotImplementedError
-                        #     all_delta_memory = torch.cat([
-                        #         all_delta_memory[:, :, self.model.remaining_indicators[-all_delta_memory.shape[2]:]],
-                        #         delta_memory
-                        #     ], dim=2)
-
-                        if context_idx == 0:
-                            # initialize all_delta_memory and all_delta_memory_ages
-                            all_delta_memory = delta_memory
-                            # all_delta_memory_ages = np.zeros([delta_memory.shape[1], delta_memory.shape[2]])
-                            # use 0 to 256 instead of all zeros
-                            all_delta_memory_ages = torch.stack([torch.arange(delta_memory.shape[2]-1, -1, -1) for _ in range(delta_memory.shape[1])])
+                        if hasattr(self.model, "virtual_num_blocks") and self.model.virtual_num_blocks is not None:
+                            counts = get_num_tokens(self.model.num_tokens * self.model.virtual_num_blocks, self.model.num_tokens, len(contexts_ids))
+                            total_num_tokens = sum(counts[1:])
+                            if total_num_tokens > self.model.memory.shape[1]:
+                                idx = 1
+                                while sum(counts[-idx:]) < self.model.memory.shape[1]:
+                                    idx += 1
+                                counts[-idx] -= sum(counts[-idx:]) - self.model.memory.shape[1]
+                                idx += 1
+                                while idx < len(counts):
+                                    counts[-idx] = 0
+                                    idx += 1
 
                         else:
+                            counts = get_num_tokens(self.model.memory.shape[1], self.model.num_tokens, len(contexts_ids))
 
-                            new_memory, new_ages, dropped_memory, dropped_ages = [], [], [], []
+                        delta_memory = None
+                        all_delta_memory, all_delta_memory_ages, dropped_delta_memory, dropped_delta_memory_ages = [], [], [], []
 
-                            for idx in range(self.model.L):
-                                # drop memory
-                                indices = torch.randperm(all_delta_memory.shape[2])
-                                indices_to_keep = indices[:all_delta_memory.shape[2] - int(all_delta_memory.shape[2] * (1 / self.model.num_blocks))]
-                                indices_to_drop = indices[len(indices_to_keep):]
-                                indices_to_keep, indices_to_drop = torch.sort(indices_to_keep)[0], torch.sort(indices_to_drop)[0]
+                        with torch.no_grad():
 
-                                new_memory.append(all_delta_memory[:, idx, indices_to_keep])
-                                dropped_memory.append(all_delta_memory[:, idx, indices_to_drop])
-                                new_ages.append(all_delta_memory_ages[idx][indices_to_keep])
-                                dropped_ages.append(all_delta_memory_ages[idx][indices_to_drop])
+                            for ctx_idx, ctx_ids in enumerate(contexts_ids):
+
+                                delta_memory = self.model(
+                                    ctx_ids,
+                                    is_injection=True,
+                                    output_delta_memory=True,
+                                    delta_memory=delta_memory
+                                ).delta_memory
+
+                                if counts[ctx_idx+1] == 0:
+                                    dropped_delta_memory.append(delta_memory)
+                                    dropped_delta_memory_ages.append(torch.stack(
+                                        [torch.arange(self.model.num_tokens).flip(dims=[0]) + self.model.num_tokens * (len(contexts_ids) - ctx_idx - 1) for _ in range(self.model.L)]
+                                    ))
+
+                                cur_delta_memory = []
+                                cur_dropped_delta_memory = []
+                                cur_memory_ages = []
+                                cur_dropped_memory_ages = []
+
+                                for layer_idx in range(delta_memory.shape[1]):
+
+                                    ages = torch.arange(self.model.num_tokens).flip(dims=[0]) + self.model.num_tokens * (len(contexts_ids) - ctx_idx - 1)
+                                    indices = torch.randperm(delta_memory.shape[2])
+                                    indices_to_keep = indices[:counts[ctx_idx+1]]
+                                    indices_to_drop = indices[counts[ctx_idx+1]:]
+                                    indices_to_keep, indices_to_drop = torch.sort(indices_to_keep)[0], torch.sort(indices_to_drop)[0]
+                                    cur_delta_memory.append(delta_memory[:, layer_idx, indices_to_keep])
+                                    cur_dropped_delta_memory.append(delta_memory[:, layer_idx, indices_to_drop])
+                                    cur_memory_ages.append(ages[indices_to_keep])
+                                    cur_dropped_memory_ages.append(ages[indices_to_drop])
+
+                                all_delta_memory.append(torch.stack(cur_delta_memory, dim=1))
+                                all_delta_memory_ages.append(torch.stack(cur_memory_ages))
+                                dropped_delta_memory.append(torch.stack(cur_dropped_delta_memory, dim=1))
+                                dropped_delta_memory_ages.append(torch.stack(cur_dropped_memory_ages))
                             
-                            all_delta_memory = torch.cat([torch.stack(new_memory, dim=1), delta_memory], dim=2)
-                            all_delta_memory_ages = torch.cat([torch.stack(new_ages) + self.model.num_tokens, torch.stack([torch.arange(delta_memory.shape[2]-1, -1, -1)  for _ in range(delta_memory.shape[1])])], dim=1)
-                            
-                            if dropped_delta_memory is None:
-                                dropped_delta_memory = torch.stack(dropped_memory, dim=1)
-                                dropped_delta_memory_ages = torch.stack(dropped_ages) + self.model.num_tokens
+                            all_delta_memory = torch.cat(all_delta_memory, dim=2)
+                            dropped_delta_memory = torch.cat(dropped_delta_memory, dim=2)
+                            all_delta_memory_ages = np.array(torch.cat(all_delta_memory_ages, dim=1))
+                            dropped_delta_memory_ages = np.array(torch.cat(dropped_delta_memory_ages, dim=1))
+
+                    else:
+
+                        delta_memory = None
+                        # initialize dropped_delta_memory and dropped_delta_memory_ages
+                        dropped_delta_memory, dropped_delta_memory_ages = None, None
+
+                        for context_idx, context_ids in enumerate(contexts_ids):
+
+                            output = self.model(input_ids=context_ids,
+                                            output_delta_memory=True,
+                                            delta_memory=delta_memory,
+                                            is_injection=True,
+                                            training=True)
+                            delta_memory = output.delta_memory
+
+                            if context_idx == 0:
+                                # initialize all_delta_memory and all_delta_memory_ages
+                                all_delta_memory = delta_memory
+                                # all_delta_memory_ages = np.zeros([delta_memory.shape[1], delta_memory.shape[2]])
+                                all_delta_memory_ages = np.stack([np.arange(delta_memory.shape[2])[::-1] for _ in range(delta_memory.shape[1])])
 
                             else:
-                                dropped_delta_memory = torch.cat([dropped_delta_memory, torch.stack(dropped_memory, dim=1)], dim=2)
-                                dropped_delta_memory_ages = torch.cat([dropped_delta_memory_ages, torch.stack(dropped_ages)], dim=1) + self.model.num_tokens
+
+                                new_memory, new_ages, dropped_memory, dropped_ages = [], [], [], []
+
+                                for idx in range(self.model.L):
+                                    # drop memory
+                                    indices = torch.randperm(all_delta_memory.shape[2])
+
+                                    if hasattr(self.model, "virtual_num_blocks") and self.model.virtual_num_blocks is not None:
+                                        indices_to_keep = indices[:all_delta_memory.shape[2] - int(all_delta_memory.shape[2] * (1 / self.model.virtual_num_blocks))]
+                                        indices_to_drop = indices[len(indices_to_keep):]
+                                        indices_to_keep, indices_to_drop = torch.sort(indices_to_keep)[0], torch.sort(indices_to_drop)[0]
+
+                                    else:
+                                        indices_to_keep = indices[:all_delta_memory.shape[2] - int(all_delta_memory.shape[2] * (1 / self.model.num_blocks))]
+                                        indices_to_drop = indices[len(indices_to_keep):]
+                                        indices_to_keep, indices_to_drop = torch.sort(indices_to_keep)[0], torch.sort(indices_to_drop)[0]
+
+                                    new_memory.append(all_delta_memory[:, idx, indices_to_keep])
+                                    dropped_memory.append(all_delta_memory[:, idx, indices_to_drop])
+                                    new_ages.append(all_delta_memory_ages[idx][np.array(indices_to_keep)])
+                                    dropped_ages.append(all_delta_memory_ages[idx][np.array(indices_to_drop)])
+                                
+                                all_delta_memory = torch.cat([torch.stack(new_memory, dim=1), delta_memory], dim=2)
+                                all_delta_memory_ages = np.concatenate([np.stack(new_ages) + self.model.num_tokens, np.stack([np.arange(delta_memory.shape[2])[::-1] for _ in range(delta_memory.shape[1])])], axis=1)
+                                
+                                if dropped_delta_memory is None:
+                                    dropped_delta_memory = torch.stack(dropped_memory, dim=1)
+                                    dropped_delta_memory_ages = np.stack(dropped_ages) + self.model.num_tokens
+
+                                else:
+                                    dropped_delta_memory = torch.cat([dropped_delta_memory, torch.stack(dropped_memory, dim=1)], dim=2)
+                                    dropped_delta_memory_ages = np.concatenate([dropped_delta_memory_ages, np.stack(dropped_ages)], axis=1) + self.model.num_tokens
+
+                        if all_delta_memory.shape[2] > self.model.memory.shape[1]:
+
+                            dropped_delta_memory = torch.cat([
+                                dropped_delta_memory,
+                                all_delta_memory[:, :, :(all_delta_memory.shape[2] - self.model.memory.shape[1])],
+                            ], dim=2)
+                            dropped_ages = np.concatenate([
+                                dropped_delta_memory_ages,
+                                all_delta_memory_ages[:, :(all_delta_memory.shape[2] - self.model.memory.shape[1])],
+                            ], axis=1)
+                            all_delta_memory = all_delta_memory[:, :, (all_delta_memory.shape[2] - self.model.memory.shape[1]):]
+                            all_delta_memory_ages = all_delta_memory_ages[:, (all_delta_memory.shape[2] - self.model.memory.shape[1]):]
 
                     retriever_weights_labels = torch.ones([self.model.memory.shape[0], self.model.memory.shape[1]], dtype=delta_memory.dtype, device=delta_memory.device)
 
@@ -920,11 +1110,63 @@ class BaseMemoryModelPL(pl.LightningModule):
 
             else:
 
+                if self.efficient_get_delta_memory:
+                    
+                    if hasattr(self.model, "virtual_num_blocks") and self.model.virtual_num_blocks is not None:
+                        counts = get_num_tokens(self.model.num_tokens * self.model.virtual_num_blocks, self.model.num_tokens, len(contexts_ids))
+                        total_num_tokens = sum(counts[1:])
+
+                        if total_num_tokens > self.model.memory.shape[1]:
+                            idx = 1
+                            while sum(counts[-idx:]) < self.model.memory.shape[1]:
+                                idx += 1
+                            counts[-idx] -= sum(counts[-idx:]) - self.model.memory.shape[1]
+                            idx += 1
+                            while idx < len(counts):
+                                counts[-idx] = 0
+                                idx += 1
+
+                    else:
+                        counts = get_num_tokens(self.model.memory.shape[1], self.model.num_tokens, len(contexts_ids))
+
+                    delta_memory = None
+                    all_delta_memory = None
+
+                    with torch.no_grad():
+                        for ctx_idx, ctx_ids in enumerate(contexts_ids):
+
+                            if counts[ctx_idx + 1] == 0:
+                                continue
+
+                            delta_memory = self.model(
+                                ctx_ids,
+                                is_injection=True,
+                                output_delta_memory=True,
+                                delta_memory=delta_memory,
+                            ).delta_memory
+
+                            cur_delta_memory = []
+                            for layer_idx in range(delta_memory.shape[1]):
+                                random_indices = np.sort(np.random.choice(np.arange(self.model.num_tokens), size=counts[ctx_idx + 1], replace=False))
+                                cur_delta_memory.append(
+                                    delta_memory[:, layer_idx, torch.tensor(random_indices)]
+                                )
+                            if all_delta_memory is None:
+                                all_delta_memory = torch.stack(cur_delta_memory, dim=1)
+                            else:
+                                all_delta_memory = torch.cat([all_delta_memory, torch.stack(cur_delta_memory, dim=1)], dim=2)
+
+                    delta_memory = all_delta_memory.detach()  
+                    return delta_memory 
+
+                if hasattr(self.model, "virtual_num_blocks") and self.model.virtual_num_blocks is not None:
+                    raise NotImplementedError("virtual_num_blocks is not implemented for vanilla injection")
+
                 all_delta_memory = None
                 delta_memory = None
                 # maintain the age of these delta_memories
 
-                context_indices = torch.arange(len(contexts_ids))
+                context_indices = np.arange(len(contexts_ids))
 
                 for i in context_indices:
 
@@ -934,12 +1176,15 @@ class BaseMemoryModelPL(pl.LightningModule):
                                         is_injection=True,
                                         training=True)
 
-                    delta_memory = output.delta_memory.detach()
+                    if i == len(context_indices) - 1 and self.keep_gradient_for_the_last_step:
+                        delta_memory = output.delta_memory
+                    else:
+                        delta_memory = output.delta_memory.detach()
 
                     if all_delta_memory is None:
                         all_delta_memory = delta_memory
                         if hasattr(self.model, 'ltm'):
-                            delta_memory_ages = torch.zeros([delta_memory.shape[1], delta_memory.shape[2]])
+                            delta_memory_ages = np.zeros([delta_memory.shape[1], delta_memory.shape[2]])
 
                     else:
                         
@@ -966,15 +1211,15 @@ class BaseMemoryModelPL(pl.LightningModule):
                                 ], dim=0))
                                 if hasattr(self.model, 'ltm'):
                                     new_delta_memory_ages.append(
-                                        torch.cat([
+                                        np.concatenate([
                                             delta_memory_ages[idx][remaining_indices] + 1,
-                                            torch.zeros(delta_memory.shape[2])
+                                            np.zeros(delta_memory.shape[2])
                                         ])
                                     )
                             
                             all_delta_memory = torch.stack(new_all_delta_memory).unsqueeze(0) 
                             if hasattr(self.model, 'ltm'):
-                                delta_memory_ages = torch.stack(new_delta_memory_ages)
+                                delta_memory_ages = np.stack(new_delta_memory_ages)
 
                         else:
                             all_delta_memory = self.model.drop_memory(all_delta_memory[0]).unsqueeze(0)
@@ -997,21 +1242,163 @@ class BaseMemoryModelPL(pl.LightningModule):
         
         return delta_memory
 
-    def training_step(self, batch, batch_idx):
+    def training_step_complete(self, contexts_ids, sentence_ids, labels):
 
-        if self.is_ift:
-            return self.ift_training_step(batch, batch_idx)
+        # 0. identify the index of the chunk to keep gradient:
+        index = np.random.choice(np.arange(min(len(contexts_ids), self.num_contexts(self.trainer.global_step))))
+
+        sentence_labels = sentence_ids.clone()
+
+        # 2.1. identify the position we are going to insert the delta_memory at:
+        # TODO: there might be errors if the length of the contexts_ids is less than the length of the final_list
+        start_idx = np.random.choice(np.arange(len(self.model.final_list) - len(contexts_ids) + 1))
+
+        # 2.2. convert all contexts_ids into delta_memory
+        delta_memory = None
+
+        all_delta_memory = []
+
+        for context_idx, context_ids in enumerate(contexts_ids):
+            
+            if context_idx == index and self.keep_gradient_in_random_insertion:
+                output = self.model(input_ids=context_ids,
+                                    output_delta_memory=True,
+                                    delta_memory=delta_memory,
+                                    is_injection=True,
+                                    training=True)
+                delta_memory = output.delta_memory 
+            
+            else:
+                if delta_memory is not None:
+                    delta_memory = delta_memory.detach()
+
+                with torch.no_grad():
+                    output = self.model(input_ids=context_ids,
+                                        output_delta_memory=True,
+                                        delta_memory=delta_memory,
+                                        is_injection=True,
+                                        training=True)
+                delta_memory = output.delta_memory.detach()
+            
+            if self.important_tokens == 'right':       
+                all_delta_memory.append(delta_memory[:, :, -self.model.final_list[start_idx + context_idx]:])
+            else:
+                all_delta_memory.append(delta_memory[:, :, :self.model.final_list[start_idx + context_idx]])
+        
+        delta_memory = torch.cat(all_delta_memory, dim=2)
+
+        output = self.model(input_ids=sentence_ids,
+            labels=sentence_labels,
+            delta_memory=delta_memory,
+            output_delta_memory=False,
+            delta_memory_position_idx=start_idx,
+            is_injection=False,
+            return_dict=True, 
+            training=True,)
+
+        loss = output.loss
+
+        self.log_loss(labels, True, len(contexts_ids), loss, random_position=True)
+
+        return loss
+
+
+    def training_step_repeat(self, contexts_ids, sentence_ids, labels):
+
+        # # randomly select four sequential chunks from contexts_ids
+        # if len(contexts_ids) > 4:
+        #     random_start_idx = np.random.choice(np.arange(len(contexts_ids) - 4 + 1))
+        #     contexts_ids = contexts_ids[random_start_idx:random_start_idx+4]
+
+        if len(contexts_ids) > len(self.model.final_list):
+            random_start_idx = np.random.choice(np.arange(len(contexts_ids) - len(self.model.final_list) + 1))
+            contexts_ids = contexts_ids[random_start_idx:random_start_idx+len(self.model.final_list)]
+
+        # 0. identify the index of the chunk to keep gradient:
+        index = np.random.choice(np.arange(min(len(contexts_ids), self.num_contexts(self.trainer.global_step))))
+
+        # 1. shard the first 50 steps of the contexts
+        contexts_ids, sentence_ids, sentence_labels = self.schedule_contexts_and_sentences(contexts_ids, sentence_ids, labels, 
+                                                                                           cat_to_maximum_memory=True,
+                                                                                           sentence_start_idx=index)
+
+        # 2. convert all contexts_ids into delta_memory, where only one chunk of them has gradient
+
+        # 2.1. identify the position we are going to insert the delta_memory at:
+        # TODO: there might be errors if the length of the contexts_ids is less than the length of the final_list
+        start_idx = np.random.choice(np.arange(len(self.model.final_list) - len(contexts_ids) + 1))
+
+        # 2.2. convert all contexts_ids into delta_memory
+        delta_memory = None
+
+        all_delta_memory = []
+
+        for context_idx, context_ids in enumerate(contexts_ids):
+
+            if context_idx == index and self.keep_gradient_in_random_insertion:
+                output = self.model(input_ids=context_ids,
+                                    output_delta_memory=True,
+                                    delta_memory=delta_memory,
+                                    is_injection=True,
+                                    training=True)
+                delta_memory = output.delta_memory   
+            
+            else:
+                if delta_memory is not None:
+                    delta_memory = delta_memory.detach()
+
+                with torch.no_grad():
+                    output = self.model(input_ids=context_ids,
+                                        output_delta_memory=True,
+                                        delta_memory=delta_memory,
+                                        is_injection=True,
+                                        training=True)
+                delta_memory = output.delta_memory.detach()
+            
+            if self.important_tokens == 'right':       
+                all_delta_memory.append(delta_memory[:, :, -self.model.final_list[start_idx + context_idx]:])
+            else:
+                all_delta_memory.append(delta_memory[:, :, :self.model.final_list[start_idx + context_idx]])
+        
+        delta_memory = torch.cat(all_delta_memory, dim=2)
+
+        output = self.model(input_ids=sentence_ids,
+            labels=sentence_labels,
+            delta_memory=delta_memory,
+            output_delta_memory=False,
+            delta_memory_position_idx=start_idx,
+            is_injection=False,
+            return_dict=True, 
+            training=True,)
+
+        loss = output.loss
+
+        self.log_loss(labels, True, len(contexts_ids), loss, random_position=True)
+
+        return loss
+
+    def training_step(self, batch, batch_idx):
 
         if len(batch) == 3:
             contexts_ids, sentence_ids, labels = batch
-            is_last_context = True
         else:
-            contexts_ids, sentence_ids, labels, is_last_context = batch
-        sentence_labels = None
+            contexts_ids, sentence_ids, sentence_labels, labels = batch
 
+        if len(contexts_ids) == 0:
+            output = self.model(input_ids=sentence_ids,
+                labels=sentence_labels,
+                output_delta_memory=False,
+                is_injection=False,
+                return_dict=True, 
+                training=True)
+            loss = output.loss
+            self.log_dict({"loss_ift_no_context": loss}, prog_bar=True, logger=True, on_step=True, on_epoch=True)
+            return loss
+
+        sentence_labels = None
         skip_injection = False
 
-        if np.random.random() < self.full_context_and_sentence_training_ratio:
+        if np.random.random() < self.full_context_and_sentence_training_ratio or labels[0] == 5:
             if labels[0] == 1:
                 sentence_ids = torch.cat(contexts_ids + [sentence_ids], dim=1)[:, :self.max_seq_length_when_detaching_memory]
             output = self.model(input_ids=sentence_ids,
@@ -1025,6 +1412,11 @@ class BaseMemoryModelPL(pl.LightningModule):
             self.log_dict({"loss_full": loss}, prog_bar=True, logger=True, on_step=True, on_epoch=True)
             return loss
 
+        if labels[0] == 4 and np.random.random() < self.train_with_random_memory_insertion_ratio and len(contexts_ids) < self.random_insertion_max_length:
+            return self.training_step_repeat(contexts_ids, sentence_ids, labels)
+        elif labels[0] == 1 and np.random.random() < self.complete_with_random_memory_insertion_ratio and len(contexts_ids) < self.random_insertion_max_length:
+            return self.training_step_complete(contexts_ids, sentence_ids, labels)
+
         if self.cache_data_for_longer_context and self.cache_data_for_longer_context_from <= self.trainer.global_step:
             
             if self.last_indicator == 1 or self.nuc_length == 0:
@@ -1032,7 +1424,7 @@ class BaseMemoryModelPL(pl.LightningModule):
             else:
                 # randomly choose between (0, 1)
                 # indicator = random.randint(0, 1)
-                if (not is_last_context) or np.random.random() < self.pass_ratio:
+                if np.random.random() < self.pass_ratio:
                     indicator = 0
                 else:
                     indicator = 1
@@ -1053,8 +1445,8 @@ class BaseMemoryModelPL(pl.LightningModule):
 
         if not skip_injection:
 
-            contexts_ids, sentence_ids = self.schedule_contexts_and_sentences(contexts_ids, sentence_ids, labels, cat_to_maximum_memory)
-            
+            contexts_ids, sentence_ids, sentence_labels = self.schedule_contexts_and_sentences(contexts_ids, sentence_ids, labels, cat_to_maximum_memory)
+
             delta_memory = None
 
             if hasattr(self.model, 'ltm') and cat_to_maximum_memory:
@@ -1066,9 +1458,6 @@ class BaseMemoryModelPL(pl.LightningModule):
                 else:
                     delta_memory = self.convert_contexts_ids_into_delta_memory(contexts_ids)
 
-        if sentence_labels is None:
-            sentence_labels = sentence_ids.clone()
-
         additional_kwargs = {}
 
         if not skip_injection:
@@ -1079,9 +1468,12 @@ class BaseMemoryModelPL(pl.LightningModule):
                 if not self.keep_gradient_for_the_last_step:
                     delta_memory = delta_memory.detach()
             elif len(contexts_ids) == 1 and not cat_to_maximum_memory:
-                if hasattr(self.model, "unique_memory_numbers"):
+                if hasattr(self.model, "unique_memory_numbers") and self.random_length_for_encoder:
                     length = np.random.choice(self.model.unique_memory_numbers)
-                    tmp_delta_memory = delta_memory[:, :, -length:]
+                    if self.important_tokens == 'right':
+                        tmp_delta_memory = delta_memory[:, :, -length:]
+                    else:
+                        tmp_delta_memory = delta_memory[:, :, :length]
 
             additional_kwargs['cat_to_maximum_memory'] = cat_to_maximum_memory
 
@@ -1105,6 +1497,26 @@ class BaseMemoryModelPL(pl.LightningModule):
                     encoder_query_indices[:, -self.model.num_tokens:] += 1
                     additional_kwargs['encoder_query_indices'] = encoder_query_indices
 
+        if self.train_retriever_on_important_tokens:
+            additional_kwargs['memory_key_indicators'] = self.model.importance_indicators
+
+        if self.scale_randomized_poe_ratio is not None:
+            if self.randomized_poe_ratio is not None:
+                if np.random.random() < self.randomized_poe_ratio:
+                    additional_kwargs['scale_randomized_poe_ratio'] = self.scale_randomized_poe_ratio
+                else:
+                    additional_kwargs['scale_randomized_poe_ratio'] = None
+            else:
+                additional_kwargs['scale_randomized_poe_ratio'] = self.scale_randomized_poe_ratio
+        
+        if self.scale_randomized_poe_ratio_for_memory is not None:
+            if self.randomized_poe_for_memory_ratio is not None:
+                if np.random.random() < self.randomized_poe_for_memory_ratio:
+                    additional_kwargs['scale_randomized_poe_ratio_for_memory'] = self.scale_randomized_poe_ratio_for_memory
+                else:
+                    additional_kwargs['scale_randomized_poe_ratio_for_memory'] = None
+            additional_kwargs['scale_randomized_poe_ratio_for_memory'] = self.scale_randomized_poe_ratio_for_memory
+
         output = self.model(input_ids=sentence_ids,
             labels=sentence_labels,
             delta_memory=tmp_delta_memory,
@@ -1117,6 +1529,8 @@ class BaseMemoryModelPL(pl.LightningModule):
         loss = output['loss']
 
         self.log_dict({'loss/avg_context_length': np.mean([x.shape[1] for x in contexts_ids])}, logger=True, on_step=True)
+        self.log_dict({'loss/num_of_contexts': len(contexts_ids)}, logger=True, on_step=True)
+        self.log_dict({'loss/sentence_length': sentence_ids.shape[1]}, logger=True, on_step=True)
 
         if self.add_selector and cat_to_maximum_memory:
 
@@ -1128,95 +1542,116 @@ class BaseMemoryModelPL(pl.LightningModule):
                 if output.encoder_retriever_weights is not None:
                     positive_negative_loss += self.get_positive_and_negative_loss(skip_injection, delta_memory, output.encoder_retriever_weights, is_encoder_loss=True, retriever_weights_labels=retriever_weights_labels)
 
-        # if self.cache_data_for_longer_context and self.cache_data_for_longer_context_from <= self.trainer.global_step:
-        assert self.cache_data_for_longer_context
+        if self.cache_data_for_longer_context:
 
-        cached_contexts_indicators_initialized = False
+            cached_contexts_indicators_initialized = False
 
-        if indicator == 1:
+            if indicator == 1:
 
-            if self.cached_exp_label == 4:
-                self.log_dict({'repeat/unrelated': loss}, logger=True, on_step=True)
-                self.log_dict({'repeat/nuc': self.nuc_length}, logger=True, on_step=True)
+                if self.cached_exp_label == 4:
+                    self.log_dict({'repeat/unrelated': loss}, logger=True, on_step=True)
+                    self.log_dict({'repeat/nuc': self.nuc_length}, logger=True, on_step=True)
+                else:
+                    self.log_dict({'loss/unrelated': (loss)}, logger=True, on_step=True)
+                    self.log_dict({'loss/unrelated_nuc': self.nuc_length}, logger=True, on_step=True)
+
+                # calculate the recall to evaluate the retrieval success rate of ltm
+                if hasattr(self.model, 'ltm'):
+                    # 1. get the age of every token in ltm
+                    # 2. find the tokens between the age that satisfies the following condition:
+                        #  < (sef.nuc_length + self.cached_contexts_length) and >= (self.nuc_length)
+                    # 3. Check how many tokens between them are extracted from ltm
+
+                    ltm_indices = output.ltm_indices
+                    avg_precision = []
+                    avg_recall = []
+                    avg_normalized_precision = []
+                    avg_normalized_recall = []
+                    for idx in range(self.model.L):
+                        if hasattr(self.model, "update_ltm_mode") and self.model.update_ltm_mode == 'immediate':
+                            ground_truth_indices = np.where((self.model.ltm_ages[idx] < (self.nuc_length + self.cached_contexts_length) * self.model.num_tokens) & (self.model.ltm_ages[idx] >= self.nuc_length * self.model.num_tokens))[0]
+                        else:
+                            ground_truth_indices = np.where((self.model.ltm_ages[idx] < (self.nuc_length + self.cached_contexts_length)) & (self.model.ltm_ages[idx] >= self.nuc_length))[0]
+                        
+                        if len(ground_truth_indices) > 0 and len(ltm_indices[idx]) > 0:
+
+                            # find the intersection between ltm_indices[idx] and ground_truth_indices:
+                            intersection = np.intersect1d(ltm_indices[idx], ground_truth_indices)
+                            precision = len(intersection) / len(ltm_indices[idx])
+                            recall = len(intersection) / len(ground_truth_indices)
+
+                            baseline_intersection = len(ground_truth_indices) * len(ltm_indices[idx]) / len(self.model.ltm[idx])
+                            baseline_precision = baseline_intersection / len(ltm_indices[idx])
+                            baseline_recall = baseline_intersection / len(ground_truth_indices)
+
+                            self.log_dict({'ltm_recall/precision_{}'.format(idx): precision}, logger=True, on_step=True)
+                            self.log_dict({'ltm_recall/recall_{}'.format(idx): recall}, logger=True, on_step=True)
+                            self.log_dict({'ltm_recall/normalized_precision_{}'.format(idx): precision - baseline_precision}, logger=True, on_step=True)
+                            self.log_dict({'ltm_recall/normalized_recall_{}'.format(idx): recall - baseline_recall}, logger=True, on_step=True)
+
+                            avg_precision.append(precision)
+                            avg_recall.append(recall)
+                            avg_normalized_precision.append(precision - baseline_precision)
+                            avg_normalized_recall.append(recall - baseline_recall)
+                    
+                    if len(avg_precision) > 0:
+                        self.log_dict({'ltm/avg_precision': np.mean(avg_precision)}, logger=True, on_step=True)
+                        self.log_dict({'ltm/avg_recall': np.mean(avg_recall)}, logger=True, on_step=True)
+                        self.log_dict({'ltm/avg_normalized_precision': np.mean(avg_normalized_precision)}, logger=True, on_step=True)
+                        self.log_dict({'ltm/avg_normalized_recall': np.mean(avg_normalized_recall)}, logger=True, on_step=True)
+
             else:
-                self.log_dict({'loss/unrelated': (loss)}, logger=True, on_step=True)
-                self.log_dict({'loss/unrelated_nuc': self.nuc_length}, logger=True, on_step=True)
 
-            # calculate the recall to evaluate the retrieval success rate of ltm
-            if hasattr(self.model, 'ltm'):
-                # 1. get the age of every token in ltm
-                # 2. find the tokens between the age that satisfies the following condition:
-                    #  < (sef.nuc_length + self.cached_contexts_length) and >= (self.nuc_length)
-                # 3. Check how many tokens between them are extracted from ltm
+                if self.last_indicator == 1:
+                    if self.cached_sentence_ids is None or np.random.random() < self.empty_prob:
+                        if self.put_cache_on_cpu:
+                            self.cached_sentence_ids = sentence_ids.cpu()
+                            self.cached_sentence_labels = sentence_labels.cpu()
+                            self.cached_exp_label = labels[0].cpu()
+                        else:
+                            self.cached_sentence_ids = sentence_ids
+                            self.cached_sentence_labels = sentence_labels
+                            self.cached_exp_label = labels[0]
+                        self.cached_contexts_length = len(contexts_ids)
+                        
+                        self.nuc_length = 0
+                        if self.add_selector:
+                            if retriever_weights_labels is not None:
+                                self.cached_contexts_indicators = retriever_weights_labels
+                            else:
+                                self.cached_contexts_indicators = torch.zeros([self.model.memory.shape[0], self.model.memory.shape[1]])
+                                self.cached_contexts_indicators[:, -delta_memory.shape[2]:] = True
+                                cached_contexts_indicators_initialized = True
 
-                ltm_indices = output.ltm_indices
-                avg_precision = []
-                avg_recall = []
-                avg_normalized_precision = []
-                avg_normalized_recall = []
-                for idx in range(self.model.L):
-                    # ltm_ages were updated when self.model.update_ltm_mode == 'immediate'
-                    if hasattr(self.model, "update_ltm_mode") and self.model.update_ltm_mode == 'immediate':
-                        ground_truth_indices = np.where((self.model.ltm_ages[idx] < (self.nuc_length + self.cached_contexts_length) * self.model.num_tokens) & (self.model.ltm_ages[idx] >= self.nuc_length * self.model.num_tokens))[0]
-                    else:
-                        ground_truth_indices = np.where((self.model.ltm_ages[idx] < (self.nuc_length + self.cached_contexts_length)) & (self.model.ltm_ages[idx] >= self.nuc_length))[0]
+                else:
+                    self.nuc_length += len(contexts_ids)
 
-                    if len(ground_truth_indices) > 0:
+                self.log_loss(labels, cat_to_maximum_memory, len(contexts_ids), loss)
 
-                        # find the intersection between ltm_indices[idx] and ground_truth_indices:
-                        intersection = np.intersect1d(ltm_indices[idx], ground_truth_indices)
-                        precision = len(intersection) / len(ltm_indices[idx])
-                        recall = len(intersection) / len(ground_truth_indices)
-
-                        baseline_intersection = len(ground_truth_indices) * len(ltm_indices[idx]) / len(self.model.ltm[idx])
-                        baseline_precision = baseline_intersection / len(ltm_indices[idx])
-                        baseline_recall = baseline_intersection / len(ground_truth_indices)
-
-                        self.log_dict({'ltm_recall/precision_{}'.format(idx): precision}, logger=True, on_step=True)
-                        self.log_dict({'ltm_recall/recall_{}'.format(idx): recall}, logger=True, on_step=True)
-                        self.log_dict({'ltm_recall/normalized_precision_{}'.format(idx): precision - baseline_precision}, logger=True, on_step=True)
-                        self.log_dict({'ltm_recall/normalized_recall_{}'.format(idx): recall - baseline_recall}, logger=True, on_step=True)
-
-                        avg_precision.append(precision)
-                        avg_recall.append(recall)
-                        avg_normalized_precision.append(precision - baseline_precision)
-                        avg_normalized_recall.append(recall - baseline_recall)
-                
-                if len(avg_precision) > 0:
-                    self.log_dict({'ltm/avg_precision': np.mean(avg_precision)}, logger=True, on_step=True)
-                    self.log_dict({'ltm/avg_recall': np.mean(avg_recall)}, logger=True, on_step=True)
-                    self.log_dict({'ltm/avg_normalized_precision': np.mean(avg_normalized_precision)}, logger=True, on_step=True)
-                    self.log_dict({'ltm/avg_normalized_recall': np.mean(avg_normalized_recall)}, logger=True, on_step=True)
+            self.last_indicator = indicator
 
         else:
 
-            if self.last_indicator == 1:
-                if self.cached_sentence_ids is None or np.random.random() < self.empty_prob:
-                    if self.put_cache_on_cpu:
-                        self.cached_sentence_ids = sentence_ids.cpu()
-                        self.cached_sentence_labels = sentence_labels.cpu()
-                        self.cached_exp_label = labels[0].cpu()
-                    else:
-                        self.cached_sentence_ids = sentence_ids
-                        self.cached_sentence_labels = sentence_labels
-                        self.cached_exp_label = labels[0]
-                    self.cached_contexts_length = len(contexts_ids)
-                    
-                    self.nuc_length = 0
-                    if self.add_selector:
-                        if retriever_weights_labels is not None:
-                            self.cached_contexts_indicators = retriever_weights_labels
-                        else:
-                            self.cached_contexts_indicators = torch.zeros([self.model.memory.shape[0], self.model.memory.shape[1]])
-                            self.cached_contexts_indicators[:, -delta_memory.shape[2]:] = True
-                            cached_contexts_indicators_initialized = True
+            warnings.warn("cache_data_for_longer_context not set to True, this is not in correct training mode")
 
-            else:
-                self.nuc_length += len(contexts_ids)
-
-            self.log_loss(labels, cat_to_maximum_memory, len(contexts_ids), loss)
-
-        self.last_indicator = indicator
+        # else:
+        #     # log the loss according to the number of contexts:
+        #     if labels[0] == 3 or labels[0] == 4:
+        #         if num_of_contexts == 1:
+        #             if cat_to_maximum_memory:
+        #                 self.log_dict({'repeat/c_with_memory_{}'.format(num_of_contexts): loss}, logger=True, on_step=True)
+        #             else:
+        #                 self.log_dict({'repeat/c_{}'.format(num_of_contexts): loss}, logger=True, on_step=True)
+        #         else:
+        #             self.log_dict({'repeat/c_{}'.format(num_of_contexts): loss}, logger=True, on_step=True)
+        #     else:
+        #         if num_of_contexts == 1:
+        #             if cat_to_maximum_memory:
+        #                 self.log_dict({'loss/related_c_with_memory_{}'.format(num_of_contexts): loss}, logger=True, on_step=True)
+        #             else:
+        #                 self.log_dict({'loss/{}_c_{}'.format("related" if (labels[0] ==1 or num_of_contexts == 1) else "unrelated", num_of_contexts): loss}, logger=True, on_step=True)
+        #         else:
+        #             self.log_dict({'loss/{}_c_{}'.format("related" if (labels[0] ==1 or num_of_contexts == 1) else "unrelated", num_of_contexts): loss}, logger=True, on_step=True)
 
         if self.add_selector and output.retriever_weights is not None:
             loss += positive_negative_loss
@@ -1256,12 +1691,23 @@ class BaseMemoryModelPL(pl.LightningModule):
                 # log per layer
                 for idx in range(self.model.L):
                     # log len(self.model.ltm[idx])
-                    self.log_dict({'ltm_per_layer/size_{}'.format(idx): len(self.model.ltm[idx])}, logger=True, on_step=True)
-                    self.log_dict({'ltm_per_layer/total_rf_{}'.format(idx): torch.sum(self.model.ltm_recall_frequencies[idx]).item()}, logger=True, on_step=True)
+                    self.log_dict({'ltm_per_layer/size_{}'.format(idx): float(len(self.model.ltm[idx]))}, logger=True, on_step=True)
+                    if isinstance(self.model.ltm_recall_frequencies[idx], torch.Tensor):
+                        self.log_dict({'ltm_per_layer/total_rf_{}'.format(idx): torch.sum(self.model.ltm_recall_frequencies[idx]).item()}, logger=True, on_step=True)
+                    else:
+                        self.log_dict({'ltm_per_layer/total_rf_{}'.format(idx): np.sum(self.model.ltm_recall_frequencies[idx])}, logger=True, on_step=True)
             
             np.mean([len(self.model.ltm[idx]) for idx in range(self.model.L)])
             self.log_dict({'ltm/size': np.mean([len(self.model.ltm[idx]) for idx in range(self.model.L)])}, logger=True, on_step=True)
-            self.log_dict({'ltm/total_rf': np.mean([torch.sum(self.model.ltm_recall_frequencies[idx]).item() for idx in range(self.model.L)])}, logger=True, on_step=True)
+            if isinstance(self.model.ltm_recall_frequencies[0], torch.Tensor):
+                self.log_dict({'ltm/total_rf': np.mean([torch.sum(self.model.ltm_recall_frequencies[idx]).item() for idx in range(self.model.L)])}, logger=True, on_step=True)
+            else:
+                self.log_dict({'ltm/total_rf': np.mean([np.sum(self.model.ltm_recall_frequencies[idx]) for idx in range(self.model.L)])}, logger=True, on_step=True)
+
+        
+        if self.lr_scheduler is not None:
+            sch = self.lr_schedulers()
+            sch.step()
 
         return loss
 
@@ -1288,40 +1734,6 @@ class BaseMemoryModelPL(pl.LightningModule):
                 'loss_with_memory': loss
             })
 
-    def longcontext_pretrain_validation_step(self, batch, batch_idx):
-        
-        doc_ids = batch[0]
-        token_idx = 1
-        step = 0
-
-        doc_ids = doc_ids[:,:32768]
-
-        losses = {idx: [] for idx in range(64)}
-
-        while token_idx < len(doc_ids[0]):
-
-            if not step % 10 == 0:
-                # inject into memory
-                self.model.inject_memory(doc_ids[:, token_idx:token_idx+512].cuda(), update_memory=True)
-                token_idx += 512
-                step += 1
-                continue
-            
-            #### for memory-based models:
-            input_ids = doc_ids[:, token_idx:token_idx+2048]
-            labels = input_ids.clone()
-            loss = self.model(input_ids=input_ids.cuda(), labels=labels.cuda()).loss.item()
-            losses[step].append(loss)
-
-            self.model.inject_memory(doc_ids[:, token_idx:token_idx+512].cuda(), update_memory=True)
-            token_idx += 512
-            step += 1
-        
-        losses = {k: np.mean(v) for k, v in losses.items() if len(v) > 0}
-        self.validation_step_outputs[-1].append({
-            'all_losses': losses
-        })
-
     def longcontext_validation_step(self, batch, batch_idx):
 
         contexts_ids, sentence_ids, answers = batch
@@ -1345,9 +1757,130 @@ class BaseMemoryModelPL(pl.LightningModule):
             input_sentence_and_answer_ids, labels=input_sentence_and_answer_labels
         ).loss
 
+        # output = self.model.generate(
+        #         inputs=sentence_ids, 
+        #         max_new_tokens=2048 - len(sentence_ids[0]),
+        #         pad_token_id=self.tokenizer.pad_token_id,
+        #     )[:, len(sentence_ids[0]):][0].detach().cpu()
+
         self.validation_step_outputs[-1].append({
+            # 'prediction': self.tokenizer.decode(output),
+            # 'target': [a[0] for a in answers],
             'loss': generation_loss.item()
         })
+
+    def longcontext_pretrain_validation_step(self, batch, batch_idx):
+        
+        doc_ids = batch[0]
+        token_idx = 1
+        step = 0
+
+        losses = {idx: [] for idx in range(64)}
+
+        while token_idx < len(doc_ids[0]):
+
+            if not (step % 2 == 0 and step > 0):
+                # inject into memory
+                self.model.inject_memory(doc_ids[:, token_idx:token_idx+(2 * self.model.num_tokens)].cuda(), update_memory=True)
+                token_idx += (2 * self.model.num_tokens)
+                step += 1
+                continue
+            
+            if step >= 64:
+                break
+
+            #### for memory-based models:
+            input_ids = doc_ids[:, token_idx:token_idx+2048]
+            labels = input_ids.clone()
+            loss = self.model(input_ids=input_ids.cuda(), labels=labels.cuda()).loss.item()
+            losses[step].append(loss)
+
+            self.model.inject_memory(doc_ids[:, token_idx:token_idx+(2 * self.model.num_tokens)].cuda(), update_memory=True)
+            token_idx += (2 * self.model.num_tokens)
+            step += 1
+        
+        losses = {k: np.mean(v) for k, v in losses.items() if len(v) > 0}
+        self.validation_step_outputs[-1].append({
+            'all_losses': losses
+        })
+
+
+    def cqa_validation_step(self, batch, batch_idx):
+
+        context_ids, sentence_ids, answer_ids = batch[:3]
+        unrelated_contexts = batch[3:]
+        unrelated_contexts = [x for x in unrelated_contexts]
+
+        if self.model.num_tokens == 1024:
+            while context_ids.shape[1] < 1536:
+                unrelated_context = unrelated_contexts.pop(0)
+                context_ids = torch.cat([context_ids, unrelated_context], dim=1)
+
+        self.model.inject_memory(
+            context_ids,
+            update_memory=True,
+        )
+
+        output = self.model.generate(
+            inputs=sentence_ids, 
+            max_new_tokens=50,
+            pad_token_id=self.tokenizer.pad_token_id,
+        )[:, len(sentence_ids[0]):][0].detach().cpu()
+        
+        middle_outputs = []
+
+        unrelated_context = unrelated_contexts.pop(0)
+
+        idx = 0
+
+        while len(unrelated_contexts) > 0:
+            
+            if self.model.num_tokens == 1024:
+
+                if unrelated_context is None or unrelated_context.shape[1] < 1536:
+                    if unrelated_context is None:
+                        unrelated_context = unrelated_contexts.pop(0)
+                    else:
+                        unrelated_context = torch.cat([unrelated_context, unrelated_contexts.pop(0)], dim=1)
+                    continue
+                    
+                if unrelated_context.shape[1] > 2048:
+                    unrelated_context = unrelated_context[:, :2048]
+                
+            else:
+
+                unrelated_context = unrelated_contexts.pop(0)
+                
+            self.model.inject_memory(
+                unrelated_context,
+                update_memory=True,
+            )
+
+            unrelated_context = None
+
+            if idx % self.val_injection_steps_per_eval == 0:
+
+                middle_out = self.model.generate(
+                    inputs=sentence_ids, 
+                    max_new_tokens=50,
+                    pad_token_id=self.tokenizer.eos_token_id
+                )[:, len(sentence_ids[0]):][0].detach().cpu()
+
+                middle_outputs.append(middle_out)
+
+            idx += 1
+            
+            if idx > (120 if self.model.num_tokens == 256 else 40):
+                break
+
+        outputs = {
+            'prediction': output,
+            'target': answer_ids[0].cpu(),
+            "middle_outputs": middle_outputs,
+        }
+
+        self.validation_step_outputs[-1].append(outputs)
+
 
     def validation_step(self, batch, batch_idx, dataloader_idx=0):
 
@@ -1361,117 +1894,15 @@ class BaseMemoryModelPL(pl.LightningModule):
                 self.validation_step_outputs.append([])
             return self.longcontext_validation_step(batch, batch_idx)
 
-        if self.validation_dataset_names[dataloader_idx] in ['slimlong']:        
+        if self.validation_dataset_names[dataloader_idx] in ['slimlong']:
             if dataloader_idx > len(self.validation_step_outputs) - 1:
                 self.validation_step_outputs.append([])
             return self.longcontext_pretrain_validation_step(batch, batch_idx)
 
-        context_ids, sentence_ids, answer_ids = batch[:3]
-        unrelated_contexts_and_mask = batch[3:]
-        qa_inputs = torch.cat([
-            sentence_ids,
-            answer_ids
-        ], dim=1)
-        qa_labels = qa_inputs.clone()
-        qa_labels[:, :sentence_ids.shape[1]] = -100
-
-        loss_without_context = self.model(input_ids=qa_inputs, 
-                                          labels=qa_labels).loss.item()
-
-        if self.backup_memory is not None:
-            self.model.memory.data = self.backup_memory.clone().to(self.model.memory.device)
-        
-        if self.add_selector and self.use_retriever_during_validation:
-            delta_memory = self.model(
-                context_ids,
-                is_injection=True,
-                output_delta_memory=True,
-                return_dict=True
-            ).delta_memory
-            memory_indicators = torch.zeros([self.model.memory.shape[0], self.model.memory.shape[1]])
-            memory_indicators[:, -delta_memory.shape[2]:] += 1
-            self.model.update_memory_with_delta_memory(delta_memory)
-
-        else:
-
-            self.model.inject_memory(
-                context_ids,
-                update_memory=True,
-            )
-
-        try:
-            output = self.model.generate(
-                inputs=sentence_ids, 
-                max_new_tokens=50,
-                pad_token_id=self.tokenizer.pad_token_id,
-                tokenizer=self.tokenizer,
-                # add stop conditions
-                stop_strings=['\n']
-            )[:, len(sentence_ids[0]):][0].detach().cpu()
-        except:
-            output = torch.tensor([1,1,1])
-
-        loss_with_context = self.model(input_ids=qa_inputs, 
-                                       labels=qa_labels).loss.item()
-
-        middle_outputs = []
-        middle_losses = []
-
-        for idx in range(len(unrelated_contexts_and_mask)):
-
-            unrelated_context = unrelated_contexts_and_mask[idx]
-
-            if self.add_selector and self.use_retriever_during_validation:
-                
-                self.model.inject_memory(
-                    unrelated_context, 
-                    update_memory=True,
-                    use_retriever=True
-                )
-
-            else:
-                self.model.inject_memory(
-                    unrelated_context, 
-                    update_memory=True,
-                )
-
-            if not (idx + 1) % self.val_injection_steps_per_eval == 0:
-                continue
-
-            try:
-                middle_out = self.model.generate(
-                    inputs=sentence_ids, 
-                    max_new_tokens=50,
-                    pad_token_id=self.tokenizer.eos_token_id,
-                    tokenizer=self.tokenizer,
-                    # add stop conditions
-                    stop_strings=['\n']
-                )[:, len(sentence_ids[0]):][0].detach().cpu()
-            except:
-                middle_out = torch.tensor([1,1,1])
-            
-            middle_outputs.append(middle_out)
-            loss = self.model(input_ids=qa_inputs, 
-                labels=qa_labels).loss.item()
-            middle_losses.append(loss)
-
-        if dataloader_idx > len(self.validation_step_outputs) - 1:
-            self.validation_step_outputs.append([])
-
-        outputs = {
-            'dataloader_idx': dataloader_idx,
-            'prediction': output,
-            'target': answer_ids[0].cpu(),
-            'dataloader_idx': dataloader_idx,
-            "middle_outputs": middle_outputs,
-            "loss_without_context": loss_without_context,
-            'loss_with_context': loss_with_context,
-            'middle_losses': middle_losses
-        }
-        if self.add_selector and self.use_retriever_during_validation:
-            outputs['memory_indicators'] = memory_indicators.sum(dim=-1).detach().cpu().numpy().mean() / self.model.num_tokens
-
-        self.validation_step_outputs[dataloader_idx].append(outputs)
+        if self.validation_dataset_names[dataloader_idx] in ['squad', 'nqa']:
+            if dataloader_idx > len(self.validation_step_outputs) - 1:
+                self.validation_step_outputs.append([])
+            return self.cqa_validation_step(batch, batch_idx)
 
     def on_validation_epoch_start(self):
         self.validation_step_outputs = []
@@ -1487,10 +1918,6 @@ class BaseMemoryModelPL(pl.LightningModule):
         accuracy = calculate_exact_hit_accuracy(preds, targets)
         qa_f1 = calculate_qa_f1_score(preds, targets)
 
-        # calculate loss
-        loss_without_context = np.mean([x['loss_without_context'] for x in output])
-        loss_with_context = np.mean([x['loss_with_context'] for x in output])
-        
         # how many ground-truth memory tokens are left
         if self.add_selector and self.use_retriever_during_validation:
             num_memory_tokens_left = np.mean([x['memory_indicators'] for x in output])
@@ -1500,16 +1927,11 @@ class BaseMemoryModelPL(pl.LightningModule):
         if self.validation_dataset_names is not None:
             self.log(f'val/{self.validation_dataset_names[dataloader_idx]}', accuracy, on_step=False, on_epoch=True, prog_bar=False, logger=True, sync_dist=True)
             self.log(f'val/{self.validation_dataset_names[dataloader_idx]}_qa_f1', qa_f1, on_step=False, on_epoch=True, prog_bar=False, logger=True, sync_dist=True)
-            self.log(f'val/{self.validation_dataset_names[dataloader_idx]}_bold_loss', loss_without_context, on_step=False, on_epoch=True, prog_bar=False, logger=True, sync_dist=True)
-            self.log(f'val/{self.validation_dataset_names[dataloader_idx]}_w_context', loss_with_context, on_step=False, on_epoch=True, prog_bar=False, logger=True, sync_dist=True)
 
         else:
             self.log(f'val/{dataloader_idx}', accuracy, on_step=False, on_epoch=True, prog_bar=False, logger=True, sync_dist=True)
             self.log(f'val/{dataloader_idx}_qa_f1', qa_f1, on_step=False, on_epoch=True, prog_bar=False, logger=True, sync_dist=True)
-            self.log(f'val/{dataloader_idx}_bold_loss', loss_without_context, on_step=False, on_epoch=True, prog_bar=False, logger=True, sync_dist=True)
-            self.log(f'val/{dataloader_idx}_w_context', loss_with_context, on_step=False, on_epoch=True, prog_bar=False, logger=True, sync_dist=True)
 
-        middle_loss = None
         # log middle outputs
         for step in range(len(output[0]['middle_outputs'])):
             preds_cur_step = []
@@ -1522,21 +1944,13 @@ class BaseMemoryModelPL(pl.LightningModule):
             qa_f1 = calculate_qa_f1_score(preds_cur_step, targets)
 
             if self.validation_dataset_names is not None:
-                middle_loss = np.mean([x['middle_losses'][step] for x in output])
                 self.log(f'val/m_{self.validation_dataset_names[dataloader_idx]}_{(step+1) * self.val_injection_steps_per_eval}', accuracy, on_step=False, on_epoch=True, prog_bar=False, logger=True, sync_dist=True)
                 self.log(f'val/m_{self.validation_dataset_names[dataloader_idx]}_{(step+1) * self.val_injection_steps_per_eval}_qa_f1', qa_f1, on_step=False, on_epoch=True, prog_bar=False, logger=True, sync_dist=True)
-                self.log(f'val/m_{self.validation_dataset_names[dataloader_idx]}_{(step+1) * self.val_injection_steps_per_eval}_loss', middle_loss, on_step=False, on_epoch=True, prog_bar=False, logger=True, sync_dist=True)
-                # generated_outputs[f'val/m_{self.validation_dataset_names[dataloader_idx]}_{(step+1) * self.val_injection_steps_per_eval}'] = accuracy
             else:
-                middle_loss = np.mean([x['middle_losses'][step] for x in output])
                 self.log(f'val/m_{idx}_{(step+1) * self.val_injection_steps_per_eval}', accuracy, on_step=False, on_epoch=True, prog_bar=False, logger=True, sync_dist=True)
                 self.log(f'val/m_{idx}_{(step+1) * self.val_injection_steps_per_eval}_qa_f1', qa_f1, on_step=False, on_epoch=True, prog_bar=False, logger=True, sync_dist=True)
-                self.log(f'val/m_{idx}_{(step+1) * self.val_injection_steps_per_eval}_loss', middle_loss, on_step=False, on_epoch=True, prog_bar=False, logger=True, sync_dist=True)
 
-        if middle_loss is not None:
-            return loss_with_context + middle_loss
-        else:
-            return loss_with_context
+        return 0
 
     def summarize_slimpajama_results(self, output, dataloader_idx):
 
@@ -1603,33 +2017,66 @@ class BaseMemoryModelPL(pl.LightningModule):
             else:
                 total_loss += self.summarize_cqa_results(output, dataloader_idx)
         
-        total_loss += np.mean(all_long_context_loss)
-        
         if len(all_long_context_loss) > 0:
+            total_loss += np.mean(all_long_context_loss)
             self.log('val/avg_long_context_loss', np.mean(all_long_context_loss), on_step=False, on_epoch=True, prog_bar=True, logger=True, sync_dist=True)
+        
         self.log('val/total_loss', total_loss, on_step=False, on_epoch=True, prog_bar=True, logger=True, sync_dist=True)
 
     def configure_optimizers(self):
 
         if self.optimizer is None:
+
             # optimizer = torch.optim.AdamW(self.model.parameters(), lr=self.learning_rate)
 
-            if self.embedding_learning_rate is not None:
-                param_groups = [
-                    {'params': [param for name, param in self.model.named_parameters() if 'embeddings' in name and param.requires_grad], 'lr': self.embedding_learning_rate},
-                    {'params': [param for name, param in self.model.named_parameters() if 'embeddings' not in name and param.requires_grad], 'lr': self.learning_rate}
-                ]
-                optimizer = torch.optim.AdamW(param_groups)
-            elif self.selector_learning_rate is not None:
-                param_groups = [
-                    {'params': [param for name, param in self.model.named_parameters() if ("query_proj" in name or "key_proj" in name) and param.requires_grad], 'lr': self.selector_learning_rate},
-                    {'params': [param for name, param in self.model.named_parameters() if not ("query_proj" in name or "key_proj" in name) and param.requires_grad], 'lr': self.learning_rate}
-                ]
-                optimizer = torch.optim.AdamW(param_groups)
-            else:
+            if self.embedding_learning_rate is None and self.selector_learning_rate is None:
                 optimizer = torch.optim.AdamW([param for param in self.model.parameters() if param.requires_grad], 
                                         lr=self.learning_rate)
-            
+
+                if self.lr_scheduler is not None:
+                    scheduler = eval(self.lr_scheduler['target'])(optimizer, **self.lr_scheduler['params'])
+                    return [optimizer], [scheduler]
+        
+            else:
+
+                param_groups = []
+
+                remaining_params = [(name, param) for name, param in self.model.named_parameters() if param.requires_grad]
+
+                if self.embedding_learning_rate is not None:
+                    embedding_params = [param for name, param in self.model.named_parameters() if 'embeddings' in name and param.requires_grad]
+                    remaining_params = [(name, param) for name, param in remaining_params if not 'embeddings' in name]
+                    param_groups.append({
+                        'name': 'embedding',
+                        'params': embedding_params,
+                        'lr': self.embedding_learning_rate
+                    })
+
+                if self.selector_learning_rate is not None:
+                    selector_params = [param for name, param in self.model.named_parameters() if ("query_proj" in name or "key_proj" in name) and param.requires_grad]
+                    remaining_params = [(name, param) for name, param in remaining_params if not ("query_proj" in name or "key_proj" in name)]
+                    param_groups.append({
+                        'name': 'selector',
+                        'params': selector_params,
+                        'lr': self.selector_learning_rate
+                    })
+                
+                param_groups.append({
+                    'name': 'main',
+                    'params': [param for name, param in remaining_params],
+                    'lr': self.learning_rate
+                })
+
+                optimizer = torch.optim.AdamW(param_groups)
+
+                if self.lr_scheduler is not None:
+                    scheduler = eval(self.lr_scheduler['target'])(optimizer, **self.lr_scheduler['params'])
+                    return [optimizer], [scheduler]
+
+        elif 'fsdp' in self.optimizer:
+
+            optimizer = torch.optim.AdamW(self.trainer.model.parameters(), lr=self.learning_rate)
+
         else:
 
             parameters = [param for param in self.model.parameters() if param.requires_grad]
@@ -1649,6 +2096,7 @@ class BaseMemoryModelPL(pl.LightningModule):
                 optimizer = DeepSpeedCPUAdam(parameters, lr=self.learning_rate)
 
             # optimizer = optimizer([param for param in self.model.parameters() if param.requires_grad], lr=self.learning_rate)
+
 
         return optimizer
         
@@ -1679,79 +2127,24 @@ class BaseMemoryModelPL(pl.LightningModule):
         weights = torch.load(ckpt_path, map_location='cpu')
         self.init_from_lora_weights(weights)
         print(f"Restored from {ckpt_path}")
-        return
 
-        # if "lora" in ckpt_path:
-        #     # load from lora weights
-        #     weights = torch.load(ckpt_path, map_location='cpu')
-        #     self.init_from_lora_weights(weights)
-        #     print(f"Restored from {ckpt_path}")
-        #     return
-        
-        # # TODO: "last.ckpt" can also be lora_weights, fix that
-
-        # if os.path.isdir(ckpt_path):
-        #     ckpt_path = os.path.join(ckpt_path, "checkpoint/mp_rank_00_model_states.pt")
-
-        # sd = torch.load(ckpt_path, map_location="cpu")
-
-        # # if type(sd) == dict:
-        # #     self.init_from_lora_weights(sd)
-        # #     print(f"Restored from {ckpt_path}")
-        # #     return
-
-        # if "state_dict" in list(sd.keys()):
-        #     sd = sd["state_dict"]
-        # else:
-        #     def rename_keys(state_dict):
-        #         new_state_dict = OrderedDict()
-        #         for key, value in state_dict.items():
-        #             new_key = key.replace("_forward_module.", "")
-        #             new_state_dict[new_key] = value
-        #         return new_state_dict
-        #     sd = rename_keys(sd["module"])
-
-        # if 'model.base_model.model.new_memory_positional_emb' in sd.keys():
-        #     if sd['model.base_model.model.new_memory_positional_emb'].shape != self.model.base_model.model.new_memory_positional_emb.shape:
-        #         try:
-        #             sd['model.base_model.model.new_memory_positional_emb'] = sd['model.base_model.model.new_memory_positional_emb'].view(self.model.base_model.model.new_memory_positional_emb.shape)
-        #         except:
-        #             del sd['model.base_model.model.new_memory_positional_emb']
-
-        # if 'model.base_model.model.memory' in sd.keys():
-        #     if sd['model.base_model.model.memory'].shape != self.model.base_model.model.memory.shape:
-        #         # delete the key in sd
-        #         del sd['model.base_model.model.memory']
-
-        # if 'model.base_model.model.model.embed_tokens.weight' in sd.keys():
-        #     if sd['model.base_model.model.model.embed_tokens.weight'].shape != self.model.base_model.model.model.embed_tokens.weight.shape:
-        #         del sd['model.base_model.model.model.embed_tokens.weight']
-        # if 'model.base_model.model.lm_head.weight' in sd.keys():
-        #     if sd['model.base_model.model.lm_head.weight'].shape != self.model.base_model.model.lm_head.weight.shape:
-        #         del sd['model.base_model.model.lm_head.weight']
-
-        # # filtered_state_dict = {k: v for k, v in sd.items() if k != 'model.memory'}
-        # # missing, unexpected = self.load_state_dict(filtered_state_dict, strict=False)
-        # missing, unexpected = self.load_state_dict(sd, strict=False)
-
-        # if len(missing) > 0 and (hasattr(self.model, "split_encoder_decoder") and self.model.split_encoder_decoder) and 'decoder' in missing[1]:
-
-        #     # Assume it is LoRA model
-        #     # Create a copy of the items to iterate over, so we don't modify the dictionary while iterating
-        #     items = list(sd.items())
-
-        #     # Loop through the copied list of items
-        #     for key, value in items:
-        #         if "model.base_model.model.model" in key:
-        #             # Replace the key as needed and update the original dictionary
-        #             new_key = key.replace("model.base_model.model.model", "model.base_model.model.decoder")
-        #             sd[new_key] = value
-
-        # missing, unexpected = self.load_state_dict(sd, strict=False)
-
-        # # missing, unexpected = self.load_state_dict(sd, strict=False)
-        # print(f"Restored from {ckpt_path} with {len(missing)} missing and {len(unexpected)} unexpected keys")
-        # print("Missing:", missing)
-        # print("Unexpected:", unexpected)
-
-
+        if hasattr(self.model.model, "ltm") and os.path.exists(os.path.join(os.path.dirname(ckpt_path), 'ltm.pt')):
+            self.model.model.ltm = torch.load(os.path.join(os.path.dirname(ckpt_path), 'ltm.pt'))
+            ltm_recall_frequencies = np.load(os.path.join(os.path.dirname(ckpt_path), 'ltm_recall_frequency.npz'))
+            self.model.model.ltm_recall_frequencies = [
+                ltm_recall_frequencies[f'arr_{i}']  for i in range(len(ltm_recall_frequencies))
+            ]
+            if os.path.exists(os.path.join(os.path.dirname(ckpt_path), 'ltm_ages.npy')):
+                self.model.model.ltm_ages = np.load(os.path.join(os.path.dirname(ckpt_path), 'ltm_ages.npy'))
+            else:
+                self.model.model.ltm_ages = [np.zeros(len(ltm)) for ltm in self.model.model.ltm]
+            
+            with torch.no_grad():
+                if self.model.maintain_memory_keys:
+                    self.model.model.memory_keys = []
+                    for idx in range(len(self.model.model.memory)):
+                        self.model.model.memory_keys.append(self.model.model.model.layers[idx].self_attn.key_proj(self.model.model.model.layers[idx].input_layernorm(self.model.model.memory[idx])).data)
+                    self.model.model.memory_keys = torch.stack(self.model.model.memory_keys)
+                
+                self.model.model.memory_ages = [np.zeros(len(memory)) for memory in self.model.model.memory]
+    

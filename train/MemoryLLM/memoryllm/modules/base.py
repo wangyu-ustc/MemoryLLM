@@ -42,6 +42,21 @@ class BaseMemoryModel(ABC):
     def __init__(self, config):
         self.config = config
 
+    def fill_in_ltm(self, delta_memory):
+
+        if len(delta_memory.shape) == 4:
+            delta_memory = delta_memory.detach()[0]
+
+        with torch.no_grad():
+            for idx in range(len(self.memory)):
+                # current_memory = self.memory.data[idx]
+                # self.ltm[idx] = current_memory[-self.num_tokens * self.num_ltm_blocks:].detach().cpu()
+                self.ltm[idx] = delta_memory[idx].detach().cpu()
+                self.ltm_recall_frequencies[idx] = torch.ones(self.ltm[idx].shape[0]) * self.initial_rf_when_moving_stm_to_ltm
+                self.ltm_keys[idx] = self.model.layers[idx].self_attn.key_proj(self.model.layers[idx].input_layernorm(delta_memory[idx].detach())).cpu()
+                # self.ltm_ages[idx] = torch.zeros(self.ltm[idx].shape[0])
+                self.ltm_ages[idx] = np.zeros(self.ltm[idx].shape[0], dtype=int)
+
     def inject_memory(self, context_ids, 
                             context_attention_mask=None,
                             delta_memory=None,
@@ -83,37 +98,64 @@ class BaseMemoryModel(ABC):
 
     def drop_memory(self, current_memory, drop_length=None, unsequeezed=True, return_remaining_indices=False, return_dropped_indices=False):
 
-        if unsequeezed:
+        if hasattr(self, "virtual_num_blocks") and self.virtual_num_blocks is not None:
 
-            perm_indices = torch.randperm(current_memory.shape[1])
+            cur_memory_length = current_memory.shape[1] if unsequeezed else current_memory.shape[0]
+
+            perm_indices = torch.randperm(cur_memory_length)
 
             if drop_length is None:
-                remaining_indices = perm_indices[:current_memory.shape[1] - int(current_memory.shape[1] * (1 / self.num_blocks))]
-            else:
-                remaining_indices = perm_indices[:current_memory.shape[1] - drop_length]
+                drop_length = int(cur_memory_length * (1 / self.num_blocks))
             
-            # sort remaining_indices to make sure it is in ascending order
+            remaining_indices = perm_indices[:cur_memory_length - int(drop_length * self.num_blocks / self.virtual_num_blocks)]
             remaining_indices = remaining_indices.sort()[0]
-            dropped_indices = perm_indices[len(remaining_indices):]
-            dropped_indices = dropped_indices.sort()[0]
+            if cur_memory_length - drop_length == 0:
+                remaining_indices = remaining_indices[:0]
+            else:
+                remaining_indices = remaining_indices[-(cur_memory_length - drop_length):]
+            # dropped_indices = perm_indices[len(remaining_indices):]
+            # dropped_indices = dropped_indices.sort()[0]
+            # TODO: check if this is correct
+            dropped_indices = torch.tensor(np.setdiff1d(np.arange(cur_memory_length), remaining_indices.cpu().numpy())).sort()[0]
 
-            current_memory = current_memory[:, remaining_indices, :]
-            
+            if unsequeezed:
+                current_memory = current_memory[:, remaining_indices, :]
+            else:
+                current_memory = current_memory[remaining_indices, :]
+
         else:
 
-            perm_indices = torch.randperm(current_memory.shape[0])
+            if unsequeezed:
 
-            if drop_length is None:
-                remaining_indices = perm_indices[:current_memory.shape[0] - int(current_memory.shape[0] * (1 / self.num_blocks))]
+                perm_indices = torch.randperm(current_memory.shape[1])
+
+                if drop_length is None:
+                    remaining_indices = perm_indices[:current_memory.shape[1] - int(current_memory.shape[1] * (1 / self.num_blocks))]
+                else:
+                    remaining_indices = perm_indices[:current_memory.shape[1] - drop_length]
+                
+                # sort remaining_indices to make sure it is in ascending order
+                remaining_indices = remaining_indices.sort()[0]
+                dropped_indices = perm_indices[len(remaining_indices):]
+                dropped_indices = dropped_indices.sort()[0]
+
+                current_memory = current_memory[:, remaining_indices, :]
+                
             else:
-                remaining_indices = perm_indices[:current_memory.shape[0] - drop_length]
-            
-            # sort remaining_indices to make sure it is in ascending order
-            remaining_indices = remaining_indices.sort()[0]
-            dropped_indices = perm_indices[len(remaining_indices):]
-            dropped_indices = dropped_indices.sort()[0]
 
-            current_memory = current_memory[remaining_indices, :]
+                perm_indices = torch.randperm(current_memory.shape[0])
+
+                if drop_length is None:
+                    remaining_indices = perm_indices[:current_memory.shape[0] - int(current_memory.shape[0] * (1 / self.num_blocks))]
+                else:
+                    remaining_indices = perm_indices[:current_memory.shape[0] - drop_length]
+                
+                # sort remaining_indices to make sure it is in ascending order
+                remaining_indices = remaining_indices.sort()[0]
+                dropped_indices = perm_indices[len(remaining_indices):]
+                dropped_indices = dropped_indices.sort()[0]
+
+                current_memory = current_memory[remaining_indices, :]
         
         if return_remaining_indices and return_dropped_indices:
             return current_memory, remaining_indices, dropped_indices
@@ -124,13 +166,14 @@ class BaseMemoryModel(ABC):
         else:
             return current_memory
 
-    def update_memory_with_delta_memory(self, delta_memory, 
+    def update_memory_with_delta_memory(self, 
+                                        delta_memory, 
                                         cached_contexts_indicators=None, 
                                         is_ltm=False,
                                         retriever_weights=None, 
                                         delta_memory_ages=None, 
-                                        max_delta_memory_age=None,
-                                        return_dropped_memories=False):
+                                        return_dropped_memories=False,
+                                        memory=None):
         
         if len(delta_memory.shape) == 4:
             delta_memory = delta_memory.detach()[0]
@@ -162,7 +205,7 @@ class BaseMemoryModel(ABC):
             self.initialized += 1
 
             if is_ltm:
-                self.memory_ages = torch.zeros([self.memory.shape[0], self.memory.shape[1]])
+                self.memory_ages = np.zeros([self.memory.shape[0], self.memory.shape[1]], dtype=int)
 
         else:
             
@@ -171,7 +214,10 @@ class BaseMemoryModel(ABC):
 
             for idx in range(len(self.memory)):
 
-                current_memory = self.memory.data[idx].detach()
+                if memory is None:
+                    current_memory = self.memory.data[idx].detach()
+                else:
+                    current_memory = memory[idx].detach()
 
                 if retriever_weights is not None:
 
@@ -206,7 +252,6 @@ class BaseMemoryModel(ABC):
                                             delta_memory.shape[1], unsequeezed=False, 
                                             return_remaining_indices=True,
                                             return_dropped_indices=True)
-
                     if return_dropped_memories:
                         dropped_memory.append(
                             self.memory.data[idx][dropped_indices]
@@ -222,50 +267,61 @@ class BaseMemoryModel(ABC):
                 if is_ltm:
 
                     if len(remaining_indices) == 0:
-
-                        if return_dropped_memories:
-                            dropped_memory_ages.append(self.memory_ages[idx])
-
+                        
                         if delta_memory_ages is not None:
+
+                            if return_dropped_memories:
+                                dropped_memory_ages.append(self.memory_ages[idx] + 1 + max(delta_memory_ages[idx]))
+
                             self.memory_ages[idx] = delta_memory_ages[idx]
                         else:
-                            # self.memory_ages[idx] = torch.zeros(delta_memory.shape[1])
-                            self.memory_ages[idx] = torch.arange(delta_memory.shape[1]-1, -1, -1)
 
-                        self.memory_recall_frequency[idx] = torch.zeros(delta_memory.shape[1])
-                        self.memory_position_indicators[idx] = torch.ones(delta_memory.shape[1])
-                    
+                            raise NotImplementedError
+
+                            if self.update_ltm_mode == 'immediate':
+                                self.memory_ages[idx] = np.arange(delta_memory.shape[1])[::-1]
+                            else:
+                                self.memory_ages[idx] = np.zeros(delta_memory.shape[1])
+                        
+                        self.memory_recall_frequency[idx] = np.zeros(delta_memory.shape[1])
+                        self.memory_position_indicators[idx] = np.ones(delta_memory.shape[1])
+
                     else:
                         
                         # np.array([1,2,3])[torch.tensor([2])] gives 3
                         # np.array([1,2,3])[np.array([2])] gives [3], we need the latter one
+                        remaining_indices = np.array(remaining_indices)
+
+                        self.memory_ages[idx] += (1 + max(delta_memory_ages[idx])) if delta_memory_ages is not None else self.num_tokens
 
                         if return_dropped_memories:
                             dropped_memory_ages.append(self.memory_ages[idx][dropped_indices])
 
                         if delta_memory_ages is not None:
-                            self.memory_ages[idx] = torch.cat([
-                                self.memory_ages[idx][remaining_indices] + 1 + (max(delta_memory_ages[idx]) if max_delta_memory_age is None else max_delta_memory_age),
+                            self.memory_ages[idx] = np.concatenate([
+                                self.memory_ages[idx][remaining_indices],
                                 delta_memory_ages[idx]
                             ])
                             assert delta_memory_ages[idx].shape[0] == delta_memory[idx].shape[0]
 
                         else:
-                            self.memory_ages[idx] = torch.cat([
-                                self.memory_ages[idx][remaining_indices] + self.num_tokens,
-                                torch.arange(delta_memory.shape[1]-1, -1, -1)
+                            assert delta_memory.shape[1] == self.num_tokens
+                            self.memory_ages[idx] = np.concatenate([
+                                self.memory_ages[idx][remaining_indices],
+                                # np.zeros([delta_memory.shape[1]])
+                                np.arange(delta_memory.shape[1])[::-1]
                             ])
 
                         if self.update_ltm_mode == 'decouple':
-                            self.memory_recall_frequency[idx] = torch.cat([
+                            self.memory_recall_frequency[idx] = np.concatenate([
                                 self.memory_recall_frequency[idx][remaining_indices], 
-                                torch.zeros([delta_memory.shape[1]])
+                                np.zeros([delta_memory.shape[1]])
                             ])
                             remaining_position_indicators = self.memory_position_indicators[idx][remaining_indices]
-                            if torch.min(remaining_position_indicators) > 1:
-                                remaining_position_indicators -= torch.min(remaining_position_indicators) - 1
-                            self.memory_position_indicators[idx] = torch.cat([
-                                remaining_position_indicators, torch.ones(delta_memory.shape[1]) * (torch.max(remaining_position_indicators) + 1)
+                            if np.min(remaining_position_indicators) > 1:
+                                remaining_position_indicators -= np.min(remaining_position_indicators) - 1
+                            self.memory_position_indicators[idx] = np.concatenate([
+                                remaining_position_indicators, np.ones(delta_memory.shape[1]) * (np.max(remaining_position_indicators) + 1)
                             ])
 
                 if cached_contexts_indicators is not None:
@@ -323,42 +379,66 @@ class BaseMemoryModel(ABC):
 
             else:
 
-                if delta_memory.shape[2] > self.num_tokens:
+                if self.virtual_num_blocks is not None:
+                    
+                    if cat_to_maximum_memory:
 
-                    old_memory = self.memory[idx].detach().unsqueeze(0).repeat(len(hidden_states), 1, 1) # detach might be unnecessary, but just to make sure
+                        old_memory = self.memory[idx].detach().unsqueeze(0).repeat(len(hidden_states), 1, 1)
 
-                    # put on cuda
-                    if old_memory.device != hidden_states.device:
-                        old_memory = old_memory.to(hidden_states.device)
+                        # now we have 12800 in old_memory, 
+                        # we need to drop cur_memory.shape[1] tokens
+                        # we can randomly drop cur_memory.shape[1] * (self.num_blocks / self.virtual_num_blocks) tokens, then drop the leftmost tokens to make sure we drop 256 tokens
+                        sampled_indices = torch.randperm(old_memory.shape[1])[:old_memory.shape[1] - int(cur_memory.shape[1] * (self.num_blocks / self.virtual_num_blocks))]
+                        sampled_indices = sampled_indices.sort()[0]
+                        if (old_memory.shape[1] - cur_memory.shape[1]) == 0:
+                            pass
+                        else:
+                            sampled_indices = sampled_indices[-(old_memory.shape[1] - cur_memory.shape[1]):]
+                            old_memory = old_memory[:, sampled_indices, :]
 
-                    # randomly sample (old_memory.shape[1] - cur_memory.shape[1]) from old_memory
-                    sampled_indices = torch.randperm(old_memory.shape[1])[:old_memory.shape[1] - cur_memory.shape[1]]
-                    # sort sampled_indices to make sure it is in ascending order
-                    sampled_indices = sampled_indices.sort()[0]
-                    old_memory = old_memory[:, sampled_indices, :]
+                            cur_memory = torch.cat([
+                                old_memory,
+                                cur_memory,
+                            ], dim=1)
 
-                    cur_memory = torch.cat([
-                        old_memory,
-                        cur_memory,
-                    ], dim=1)
+                else:
 
-                if delta_memory.shape[2] == self.num_tokens and cat_to_maximum_memory:
-                    # we need to cat the memory when there is only one context
-                    old_memory = self.memory[idx].detach().unsqueeze(0).repeat(len(hidden_states), 1, 1) # detach might be unnecessary, but just to make sure
+                    if delta_memory.shape[2] > self.num_tokens:
 
-                    # put on cuda
-                    if old_memory.device != hidden_states.device:
-                        old_memory = old_memory.to(hidden_states.device)
+                        old_memory = self.memory[idx].detach().unsqueeze(0).repeat(len(hidden_states), 1, 1) # detach might be unnecessary, but just to make sure
 
-                    # randomly sample (old_memory.shape[1] - cur_memory.shape[1]) from old_memory
-                    sampled_indices = torch.randperm(old_memory.shape[1])[:old_memory.shape[1] - cur_memory.shape[1]]
-                    # sort sampled_indices to make sure it is in ascending order
-                    sampled_indices = sampled_indices.sort()[0]
-                    old_memory = old_memory[:, sampled_indices, :]
-                    cur_memory = torch.cat([
-                        old_memory,
-                        cur_memory,
-                    ], dim=1)
+                        # put on cuda
+                        if old_memory.device != hidden_states.device:
+                            old_memory = old_memory.to(hidden_states.device)
+
+                        # randomly sample (old_memory.shape[1] - cur_memory.shape[1]) from old_memory
+                        sampled_indices = torch.randperm(old_memory.shape[1])[:old_memory.shape[1] - cur_memory.shape[1]]
+                        # sort sampled_indices to make sure it is in ascending order
+                        sampled_indices = sampled_indices.sort()[0]
+                        old_memory = old_memory[:, sampled_indices, :]
+
+                        cur_memory = torch.cat([
+                            old_memory,
+                            cur_memory,
+                        ], dim=1)
+
+                    if delta_memory.shape[2] == self.num_tokens and cat_to_maximum_memory:
+                        # we need to cat the memory when there is only one context
+                        old_memory = self.memory[idx].detach().unsqueeze(0).repeat(len(hidden_states), 1, 1) # detach might be unnecessary, but just to make sure
+
+                        # put on cuda
+                        if old_memory.device != hidden_states.device:
+                            old_memory = old_memory.to(hidden_states.device)
+
+                        # randomly sample (old_memory.shape[1] - cur_memory.shape[1]) from old_memory
+                        sampled_indices = torch.randperm(old_memory.shape[1])[:old_memory.shape[1] - cur_memory.shape[1]]
+                        # sort sampled_indices to make sure it is in ascending order
+                        sampled_indices = sampled_indices.sort()[0]
+                        old_memory = old_memory[:, sampled_indices, :]
+                        cur_memory = torch.cat([
+                            old_memory,
+                            cur_memory,
+                        ], dim=1)
 
         if self.add_bos_embedding:
             if self.bos_embedding[idx].device != cur_memory.device:
@@ -383,7 +463,8 @@ class BaseMemoryModel(ABC):
                 cur_memory = self.memory[idx].unsqueeze(0).repeat(len(hidden_states), 1, 1)
         else:
             cur_memory = delta_memory[:, idx]
-            if (not is_injection) and cat_to_maximum_memory :
+            if (not is_injection) and cat_to_maximum_memory:
+
                 old_memory = self.memory[idx].detach().unsqueeze(0).repeat(len(hidden_states), 1, 1) # detach might be unnecessary, but just to make sure
 
                 # put on cuda
@@ -391,24 +472,55 @@ class BaseMemoryModel(ABC):
                     old_memory = old_memory.to(hidden_states.device)
 
                 # randomly sample (old_memory.shape[1] - cur_memory.shape[1]) from old_memory
-                sampled_indices = torch.randperm(old_memory.shape[1])[:old_memory.shape[1] - cur_memory.shape[1]]
-                # sort sampled_indices to make sure it is in ascending order
-                sampled_indices = sampled_indices.sort()[0]
-                old_memory = old_memory[:, sampled_indices, :]
-                cur_memory = torch.cat([
-                    old_memory,
-                    cur_memory,
-                ], dim=1)
+                if hasattr(self, "virtual_num_blocks") and self.virtual_num_blocks is not None:
+                    sampled_indices = torch.randperm(old_memory.shape[1])[:old_memory.shape[1] - int(cur_memory.shape[1] * (self.num_blocks / self.virtual_num_blocks))]
+                    sampled_indices = sampled_indices.sort()[0]
+                    if (old_memory.shape[1] - cur_memory.shape[1]) == 0:
+                        pass
+                    else:
+                        sampled_indices = sampled_indices[-(old_memory.shape[1] - cur_memory.shape[1]):]
+                        old_memory = old_memory[:, sampled_indices, :]
+
+                    cur_memory = torch.cat([
+                        old_memory,
+                        cur_memory,
+                    ], dim=1)
+
+                else:
+                    sampled_indices = torch.randperm(old_memory.shape[1])[:old_memory.shape[1] - cur_memory.shape[1]]
+                    # sort sampled_indices to make sure it is in ascending order
+                    sampled_indices = sampled_indices.sort()[0]
+                    old_memory = old_memory[:, sampled_indices, :]
+                    cur_memory = torch.cat([
+                        old_memory,
+                        cur_memory,
+                    ], dim=1)
+                
         return cur_memory
 
     def get_ltm(self, idx, hidden_states, random_retriever_length=False):
 
-        with torch.no_grad():
+        num_ltm_tokens = self.num_ltm_tokens if hasattr(self, "num_ltm_tokens") else self.num_ltm_blocks * self.num_tokens
 
-            if hasattr(self, "num_ltm_tokens"):
-                num_ltm_tokens = self.num_ltm_tokens
-            else:
-                num_ltm_tokens = self.num_ltm_blocks * self.num_tokens
+        # get ltm_keys if ltm_keys are None
+        if self.ltm_keys[idx] is None:
+
+            with torch.no_grad():
+
+                ltm = self.ltm[idx]
+                tmp_ltm_keys = []
+                batch_size = 64
+
+                for batch_ltm in torch.split(ltm, batch_size):
+                    batch_ltm = batch_ltm.to(hidden_states.device).to(hidden_states.dtype)
+                    ltm_keys = self.model.layers[idx].self_attn.key_proj(self.model.layers[idx].input_layernorm(batch_ltm))
+                    tmp_ltm_keys.append(ltm_keys)
+                tmp_ltm_keys = torch.cat(tmp_ltm_keys, dim=0)
+
+            tmp_ltm_keys = tmp_ltm_keys.detach().cpu()
+            self.ltm_keys[idx] = tmp_ltm_keys
+
+        with torch.no_grad():
 
             if len(self.ltm_keys[idx]) < num_ltm_tokens:
 
@@ -428,18 +540,50 @@ class BaseMemoryModel(ABC):
 
                 queries = self.model.layers[idx].self_attn.query_proj(self.model.layers[idx].input_layernorm(hidden_states[0]))
                 predictions = (queries @ self.ltm_keys[idx].to(queries.device).transpose(-2, -1)).sigmoid().mean(dim=0)
-                indices = torch.topk(predictions, k=num_ltm_tokens).indices
-                indices = torch.sort(indices)[0]
 
-            # pseudo_queries = queries @ self.model.layers[idx].self_attn.key_proj.weight
-            # # currently using the simplest methosd to query, TODO: update it to FAISS
-            # predictions = (pseudo_queries @ self.ltm[idx].to(queries.device).transpose(-2, -1)).sigmoid().mean(dim=0)
-            # indices = torch.topk(predictions, k=self.num_ltm_blocks*self.num_tokens).indices
-            # indices = torch.sort(indices)[0]
+                if self.cached_dropped_memories is not None:
+                    # cached_dropped_keys = self.model.layers[idx].self_attn.key_proj(self.model.layers[idx].input_layernorm(self.cached_dropped_memories[idx].to(queries.device)))
+                    # cached_predictions = (queries @ cached_dropped_keys.transpose(-2, -1)).sigmoid().mean(dim=0)
+                    cached_predictions = (queries @ self.cached_dropped_keys[idx].to(queries.device).transpose(-2, -1)).sigmoid().mean(dim=0)
+                    predictions = torch.cat([predictions, cached_predictions], dim=0)
+
+                indices = torch.topk(predictions, k=num_ltm_tokens).indices
+                indices = torch.sort(indices)[0].cpu()
+
+        # ages = self.ltm_ages[idx][indices.detach().cpu()]
+        # indices = indices[np.argsort(ages)[::-1].copy()]
+        # x = self.ltm[idx][indices.detach().cpu()].to(hidden_states.device)
+        # return x, indices.detach().cpu()
+
+        if self.cached_dropped_memories is None:
+            ages = self.ltm_ages[idx][indices.detach().cpu()]
+            indices = indices[np.argsort(ages)[::-1].copy()]
+            x = self.ltm[idx][indices.detach().cpu()].to(hidden_states.device)
+            return x.detach(), indices.detach().cpu()
         
-        x = self.ltm[idx][indices.detach().cpu()].to(hidden_states.device)
-        self.ltm_recall_frequencies[idx][indices.detach().cpu().numpy()] += 1
-        return x, indices.detach().cpu()
+        else:
+
+            with torch.no_grad():
+
+                ltm_indices = indices[torch.where(indices < self.ltm[idx].shape[0])[0]]
+                dropped_indices = indices[len(ltm_indices):] - self.ltm[idx].shape[0]
+
+                ltm_ages = self.ltm_ages[idx][np.array(ltm_indices.detach().cpu())]
+                dropped_ages = self.cached_dropped_memory_ages[idx][np.array(dropped_indices.detach().cpu())]
+
+                ltm_x = self.ltm[idx][ltm_indices].to(hidden_states.device)
+                dropped_x = self.cached_dropped_memories[idx][dropped_indices].to(hidden_states.device)
+
+                if len(dropped_ages) > 0 and len(ltm_ages) > 0:
+                    all_ages = np.concatenate([ltm_ages, dropped_ages])
+                else:
+                    all_ages = ltm_ages if len(ltm_ages) > 0 else dropped_ages
+
+                all_x = torch.cat([ltm_x, dropped_x], dim=0)
+
+                all_x = all_x[np.argsort(all_ages)[::-1].copy()]
+
+            return all_x.detach(), ltm_indices
     
     def update_recall_frequency(self, idx, hidden_states):
 
@@ -449,21 +593,7 @@ class BaseMemoryModel(ABC):
             indices = torch.where((queries @ keys.transpose(-2, -1)).sigmoid().mean(dim=0) > 0.5)[0]
             self.memory_recall_frequency[idx][indices.detach().cpu().numpy()] += 1
     
-    def fill_in_ltm(self, delta_memory):
-
-        if len(delta_memory.shape) == 4:
-            delta_memory = delta_memory.detach()[0]
-
-        with torch.no_grad():
-            for idx in range(len(self.memory)):
-                # current_memory = self.memory.data[idx]
-                # self.ltm[idx] = current_memory[-self.num_tokens * self.num_ltm_blocks:].detach().cpu()
-                self.ltm[idx] = delta_memory[idx].detach().cpu()
-                self.ltm_recall_frequencies[idx] = torch.ones(self.ltm[idx].shape[0]) * self.initial_rf_when_moving_stm_to_ltm
-                self.ltm_keys[idx] = self.model.layers[idx].self_attn.key_proj(self.model.layers[idx].input_layernorm(delta_memory[idx].detach())).cpu()
-                self.ltm_ages[idx] = torch.zeros(self.ltm[idx].shape[0])
-
-    def update_ltm(self, dropped_memories=None, dropped_memory_ages=None):
+    def update_ltm(self, dropped_memories=None, dropped_memory_ages=None, device=None, cached_dropped_keys=None):
 
         with torch.no_grad():
 
@@ -480,10 +610,10 @@ class BaseMemoryModel(ABC):
                     # within the positions with indicators being 0, find the positions with recall frequency larger than 0
                     # put the positions with recall frequency larger than 0 into the long-term memory
 
-                    start_step = torch.max(current_memory_position_indicators) - self.update_ltm_frequency - self.update_ltm_T0 + 1
-                    end_step = torch.max(current_memory_position_indicators) - self.update_ltm_T0 + 1
+                    start_step = np.max(current_memory_position_indicators) - self.update_ltm_frequency - self.update_ltm_T0 + 1
+                    end_step = np.max(current_memory_position_indicators) - self.update_ltm_T0 + 1
 
-                    positions_to_input_into_ltm = torch.where((current_memory_position_indicators >= start_step) & (current_memory_position_indicators <= end_step) & (current_memory_recall_frequency > 1))[0]
+                    positions_to_input_into_ltm = np.where((current_memory_position_indicators >= start_step) & (current_memory_position_indicators <= end_step) & (current_memory_recall_frequency > 1))[0]
                     memory_to_input_into_ltm = current_memory[positions_to_input_into_ltm]
 
                     self.ltm[idx] = torch.cat([
@@ -492,14 +622,14 @@ class BaseMemoryModel(ABC):
                     ])
 
                     if self.initial_rf_when_moving_stm_to_ltm is None:
-                        self.ltm_recall_frequencies[idx] = torch.cat(
+                        self.ltm_recall_frequencies[idx] = np.concatenate(
                             [self.ltm_recall_frequencies[idx],
                             current_memory_recall_frequency[positions_to_input_into_ltm]]
                         )
                     else:
-                        self.ltm_recall_frequencies[idx] = torch.cat(
+                        self.ltm_recall_frequencies[idx] = np.concatenate(
                             [self.ltm_recall_frequencies[idx],
-                            torch.ones(positions_to_input_into_ltm.shape[0]) * self.initial_rf_when_moving_stm_to_ltm]
+                            np.ones(positions_to_input_into_ltm.shape[0]) * self.initial_rf_when_moving_stm_to_ltm]
                         )
 
                     # TODO: change this to using "memory_keys" when self.maintain_memory_keys is True
@@ -512,14 +642,14 @@ class BaseMemoryModel(ABC):
                         ).detach().cpu()
                     ])
 
-                    self.ltm_ages[idx] = torch.cat([
+                    self.ltm_ages[idx] = np.concatenate([
                         self.ltm_ages[idx],
                         self.memory_ages[idx][positions_to_input_into_ltm]
                     ])
 
                     # if len(self.ltm[idx]) > self.converge_ltm_number_tokens:
-                    self.ltm_recall_frequencies[idx] -= self.decay_frequency
-                    indices = torch.where(self.ltm_recall_frequencies[idx] > 0.01)[0] # sometimes it may be "2.0539126e-15", using 0.01 to filter out these cases
+                    self.ltm_recall_frequencies[idx] -= self.decay_frequency * (self.update_step / (self.update_ltm_frequency * self.num_tokens))
+                    indices = np.where(self.ltm_recall_frequencies[idx] > 0.01)[0] # sometimes it may be "2.0539126e-15", using 0.01 to filter out these cases
                     if len(indices) > self.num_ltm_blocks * self.num_tokens:
                         self.ltm[idx] = self.ltm[idx][indices]
                         self.ltm_keys[idx] = self.ltm_keys[idx][indices]
@@ -530,76 +660,43 @@ class BaseMemoryModel(ABC):
                         self.ltm_recall_frequencies[idx] += self.decay_frequency
 
                 else:
+                    
+                    current_memory = dropped_memories[idx]
+                    self.ltm[idx] = torch.cat([
+                        self.ltm[idx],
+                        current_memory.detach().cpu()
+                    ])
+                    assert self.initial_rf_when_moving_stm_to_ltm is not None
+                    self.ltm_recall_frequencies[idx] = np.concatenate(
+                        [self.ltm_recall_frequencies[idx],
+                        np.ones(current_memory.shape[0]) * self.initial_rf_when_moving_stm_to_ltm]
+                    )
 
-                    # if dropped_memory_ages[idx].max().item() > 4 and idx == 0:
-                        
-                    #     start_time = time.time()
-                    #     current_memory = dropped_memories[idx]
-                    #     torch.cat([
-                    #         self.ltm[idx],
-                    #         current_memory.detach().cpu()
-                    #     ])
-                    #     assert self.initial_rf_when_moving_stm_to_ltm is not None
-                    #     torch.cat(
-                    #         [self.ltm_recall_frequencies[idx],
-                    #         torch.ones(current_memory.shape[0]) * self.initial_rf_when_moving_stm_to_ltm]
-                    #     )
+                    if cached_dropped_keys is not None:
 
-                    #     torch.cat([
-                    #         self.ltm_keys[idx],
-                    #         # debug:
-                    #         # torch.randn([current_memory.shape[0], self.ltm_keys[idx][0].shape[-1]])
-                    #         self.model.layers[idx].self_attn.key_proj(
-                    #             self.model.layers[idx].input_layernorm(
-                    #                 current_memory
-                    #             )
-                    #         ).detach().cpu()
-                    #     ])
+                        self.ltm_keys[idx] = torch.cat([
+                            self.ltm_keys[idx],
+                            cached_dropped_keys[idx]
+                        ])
+                    
+                    else:
 
-                    #     torch.cat([
-                    #         self.ltm_ages[idx],
-                    #         dropped_memory_ages[idx]
-                    #     ])
-                    #     end_time = time.time()
-                    #     print("using key_proj:", end_time - start_time)
+                        self.ltm_keys[idx] = torch.cat([
+                            self.ltm_keys[idx],
+                            self.model.layers[idx].self_attn.key_proj(
+                                self.model.layers[idx].input_layernorm(
+                                    current_memory.to(device) if device is not None else current_memory
+                                )
+                            ).detach().cpu()
+                        ])
 
-
-
-                    #     start_time = time.time()
-                    #     current_memory = dropped_memories[idx]
-                    #     torch.cat([
-                    #         self.ltm[idx],
-                    #         current_memory.detach().cpu()
-                    #     ])
-                    #     assert self.initial_rf_when_moving_stm_to_ltm is not None
-                    #     torch.cat(
-                    #         [self.ltm_recall_frequencies[idx],
-                    #         torch.ones(current_memory.shape[0]) * self.initial_rf_when_moving_stm_to_ltm]
-                    #     )
-
-                    #     torch.cat([
-                    #         self.ltm_keys[idx],
-                    #         # debug:
-                    #         # torch.randn([current_memory.shape[0], self.ltm_keys[idx][0].shape[-1]])
-                    #         self.model.layers[idx].self_attn.key_proj(
-                    #             self.model.layers[idx].input_layernorm(
-                    #                 current_memory
-                    #             )
-                    #         ).detach().cpu()
-                    #     ])
-
-                    #     torch.cat([
-                    #         self.ltm_ages[idx],
-                    #         dropped_memory_ages[idx]
-                    #     ])
-                    #     end_time = time.time()
-                    #     print("without key_proj:", end_time - start_time)
-                    #     end_time = time.time()
-
-                    #     import ipdb; ipdb.set_trace()
+                    self.ltm_ages[idx] = np.concatenate([
+                        self.ltm_ages[idx].astype(int),
+                        dropped_memory_ages[idx]
+                    ])
 
                     self.ltm_recall_frequencies[idx] -= self.decay_frequency
-                    indices = torch.where(self.ltm_recall_frequencies[idx] > 0.01)[0] # sometimes it may be "2.0539126e-15", using 0.01 to filter out these cases
+                    indices = np.where(self.ltm_recall_frequencies[idx] > 0.01)[0] # sometimes it may be "2.0539126e-15", using 0.01 to filter out these cases
                     if len(indices) > self.num_ltm_blocks * self.num_tokens:
                         self.ltm[idx] = self.ltm[idx][indices]
                         self.ltm_keys[idx] = self.ltm_keys[idx][indices]
@@ -608,99 +705,5 @@ class BaseMemoryModel(ABC):
 
                     else:
                         self.ltm_recall_frequencies[idx] += self.decay_frequency
-
-                    current_memory = dropped_memories[idx]
-
-                    # use dropped_memory_ages to reorder some of the memories
-                    if dropped_memory_ages[idx].max() > self.ltm_ages[idx].min():
-
-                        indices_to_reorder_from = torch.where(self.ltm_ages[idx] < dropped_memory_ages[idx].max())[0][0]
-                        tmp_ltm = self.ltm[idx][indices_to_reorder_from:]
-                        self.ltm[idx] = self.ltm[idx][:indices_to_reorder_from]
-                        tmp_ltm_ages = self.ltm_ages[idx][indices_to_reorder_from:]
-                        self.ltm_ages[idx] = self.ltm_ages[idx][:indices_to_reorder_from]
-                        tmp_ltm_recall_frequencies = self.ltm_recall_frequencies[idx][indices_to_reorder_from:]
-                        self.ltm_recall_frequencies[idx] = self.ltm_recall_frequencies[idx][:indices_to_reorder_from]
-                        tmp_ltm_keys = self.ltm_keys[idx][indices_to_reorder_from:]
-                        self.ltm_keys[idx] = self.ltm_keys[idx][:indices_to_reorder_from]
-
-                        current_memory_keys = torch.cat([
-                            tmp_ltm_keys,
-                            self.model.layers[idx].self_attn.key_proj(
-                                self.model.layers[idx].input_layernorm(
-                                    current_memory
-                                )
-                            ).detach().cpu()
-                        ])
-                        current_memory = torch.cat([
-                            tmp_ltm,
-                            current_memory.detach().cpu()
-                        ])
-                        current_memory_ages = torch.cat([
-                            tmp_ltm_ages,
-                            dropped_memory_ages[idx]
-                        ])
-                        current_memory_recall_frequencies = torch.cat([
-                            tmp_ltm_recall_frequencies,
-                            torch.ones(current_memory.shape[0]) * self.initial_rf_when_moving_stm_to_ltm
-                        ])
-                        
-                        try:
-                            # reorder according to the ages with descending order
-                            indices = torch.argsort(current_memory_ages, descending=True)
-                            current_memory = current_memory[indices]
-                            current_memory_ages = current_memory_ages[indices]
-                            current_memory_recall_frequencies = current_memory_recall_frequencies[indices]
-                            current_memory_keys = current_memory_keys[indices]
-                        except:
-                            import ipdb; ipdb.set_trace()
-
-                        self.ltm[idx] = torch.cat([
-                            self.ltm[idx],
-                            current_memory.detach().cpu()
-                        ])
-                        self.ltm_ages[idx] = torch.cat([
-                            self.ltm_ages[idx],
-                            current_memory_ages
-                        ])
-                        self.ltm_recall_frequencies[idx] = torch.cat([
-                            self.ltm_recall_frequencies[idx],
-                            current_memory_recall_frequencies
-                        ])
-                        self.ltm_keys[idx] = torch.cat([
-                            self.ltm_keys[idx],
-                            current_memory_keys
-                        ])
-
-                    else:
-
-                        self.ltm[idx] = torch.cat([
-                            self.ltm[idx],
-                            current_memory.detach().cpu()
-                        ])
-                        
-                        assert self.initial_rf_when_moving_stm_to_ltm is not None
-                        self.ltm_recall_frequencies[idx] = torch.cat(
-                            [self.ltm_recall_frequencies[idx],
-                            torch.ones(current_memory.shape[0]) * self.initial_rf_when_moving_stm_to_ltm]
-                        )
-
-                        self.ltm_keys[idx] = torch.cat([
-                            self.ltm_keys[idx],
-                            # debug:
-                            # torch.randn([current_memory.shape[0], self.ltm_keys[idx][0].shape[-1]])
-                            self.model.layers[idx].self_attn.key_proj(
-                                self.model.layers[idx].input_layernorm(
-                                    current_memory
-                                )
-                            ).detach().cpu()
-                        ])
-
-                        self.ltm_ages[idx] = torch.cat([
-                            self.ltm_ages[idx],
-                            dropped_memory_ages[idx]
-                        ])
-
-                    
 
 

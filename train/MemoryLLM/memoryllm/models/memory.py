@@ -49,7 +49,17 @@ class LlamaMemoryModelPL(BaseMemoryModelPL):
                        decay_frequency=None,
                        dropping_interval=None,
                        add_memory_embedding=False,
+                       spread_embeddings=False,
+                       min_num_tokens=25,
+                       important_tokens='right',
                        update_ltm_mode='decouple',
+                       ltm_configs=None,
+                       put_cached_dropped_memory_on_cpu=None,
+                       initialized=False,
+                       wrap_memory=False,
+                       all_params_require_grad=False,
+                       fix_poe_for_encoder=False,
+                       virtual_num_blocks=None,
                        *args,
                        **kwargs):
         
@@ -69,9 +79,22 @@ class LlamaMemoryModelPL(BaseMemoryModelPL):
         config.add_selector = add_selector
         config.detach_hidden_state = detach_hidden_state
         config.maintain_memory_keys = maintain_memory_keys
+        config.min_num_tokens = min_num_tokens
+        config.important_tokens = important_tokens
+        config.wrap_memory = wrap_memory
+        config.fix_poe_for_encoder = fix_poe_for_encoder
+        
+        if virtual_num_blocks is not None:
+            config.virtual_num_blocks = virtual_num_blocks
+        
+        if put_cached_dropped_memory_on_cpu is not None:
+            config.put_cached_dropped_memory_on_cpu = put_cached_dropped_memory_on_cpu
+        
+        self.important_tokens = important_tokens
         
         if add_memory_embedding is not None:
             config.add_memory_embedding = add_memory_embedding
+            config.spread_embeddings = spread_embeddings
 
         self.selector_layers = None
         if add_selector:
@@ -104,6 +127,8 @@ class LlamaMemoryModelPL(BaseMemoryModelPL):
         if decay_frequency is not None:
             config.decay_frequency = decay_frequency
         config.update_ltm_mode = update_ltm_mode
+        if ltm_configs is not None:
+            config.ltm_configs = dict(ltm_configs)
 
         # for tree-structured dropping
         if dropping_interval is not None:
@@ -147,6 +172,11 @@ class LlamaMemoryModelPL(BaseMemoryModelPL):
         self.tokenizer = AutoTokenizer.from_pretrained(model_path if tokenizer_path is None else tokenizer_path)
         self.tokenizer.pad_token_id = self.tokenizer.eos_token_id
 
+        # if instruction is not None:
+        #     self.instruction_ids = self.tokenizer(instruction, return_tensors='pt', add_special_tokens=False)
+        # else:
+        #     self.instruction_ids = None
+
         config.bos_token_id = self.tokenizer.bos_token_id
         config.pad_token_id = self.tokenizer.pad_token_id
 
@@ -187,29 +217,36 @@ class LlamaMemoryModelPL(BaseMemoryModelPL):
                         if "lora" in name:
                             param.requires_grad = True
                 
-            if hasattr(model.base_model, "new_memory_positional_emb"):
-                model.base_model.new_memory_positional_emb.requires_grad=True
-            if hasattr(model.base_model, "memory_token_start_indication_embedding"):
-                model.base_model.memory_token_start_indication_embedding.requires_grad=True
-            if hasattr(model.base_model, "bos_embedding"):
-                model.base_model.bos_embedding.requires_grad=True
-            if hasattr(model.base_model, "special_token_embeddings"):
-                model.base_model.special_token_embeddings.requires_grad=True
-            if add_memory_embedding:
-                model.base_model.memory_embeddings.requires_grad=True
-            if self.add_selector:
-                for name, param in model.named_parameters():
-                    if "query_proj" in name or "key_proj" in name:
-                        param.requires_grad = True
-                        
+        if hasattr(model.base_model, "new_memory_positional_emb"):
+            model.base_model.new_memory_positional_emb.requires_grad=True
+        if hasattr(model.base_model, "memory_token_start_indication_embedding"):
+            model.base_model.memory_token_start_indication_embedding.requires_grad=True
+        if hasattr(model.base_model, "bos_embedding"):
+            model.base_model.bos_embedding.requires_grad=True
+        if hasattr(model.base_model, "special_token_embeddings"):
+            model.base_model.special_token_embeddings.requires_grad=True
+        if add_memory_embedding:
+            model.base_model.memory_embeddings.requires_grad=True
+        if self.add_selector:
+            for name, param in model.named_parameters():
+                if "query_proj" in name or "key_proj" in name:
+                    param.requires_grad = True
+
+        if all_params_require_grad:
+            for name, param in model.named_parameters():
+                param.requires_grad = True
+
         self.model = model
 
         if ckpt_path is not None:
-            # TODO: check if bos_embedding here is trained
             self.init_from_ckpt(ckpt_path)
 
         if reinit_memory:
-            self.model.initialized -= 1
+            self.model.initialized.data -= self.model.initialized.item()
+
+        if initialized:
+            if not self.model.initialized:
+                self.model.initialized += 1
 
         if max_length is not None:
             self.max_length = max_length

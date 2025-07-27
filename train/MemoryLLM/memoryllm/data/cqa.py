@@ -9,6 +9,7 @@ class CQADataset(Dataset):
     def __init__(self, 
             root,
             max_length=768,
+            min_length=512,
             num=None,
             num_unrelated_contexts=0,
             expand_to_max_length=False,
@@ -16,6 +17,7 @@ class CQADataset(Dataset):
         ):
         self.type = 'cqa'
         self.max_length = max_length
+        self.min_length = min_length
         self.num_unrelated_contexts = num_unrelated_contexts
         self.expand_to_max_length = expand_to_max_length
         self.questions = []

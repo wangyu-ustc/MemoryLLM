@@ -4,7 +4,7 @@ import torch
 import gzip
 import random
 import numpy as np
-from datasets import load_dataset
+from datasets import load_dataset, load_from_disk
 from transformers import AutoTokenizer
 from torch.utils.data import IterableDataset
 
@@ -57,9 +57,11 @@ class MixedStreamDataset(IterableDataset):
                  split="train",
                  tokenizer_path=None,
                  min_length=256,
+                 longdoc_min_length=None,
                  max_length=768,
                  num_tokens=768,
                  max_seq_length=None,
+                 min_seq_length_for_full_context_and_sentence=None,
                  end_special_token="",
                  add_special_tokens=False,
                  target_is_context=False,
@@ -77,14 +79,22 @@ class MixedStreamDataset(IterableDataset):
                      '16k-32k': 0.2,
                      '32k-64k': 0.1
                  },
+                 long_doc_start_chunk={
+                    '4k-8k': 0,
+                    '8k-16k': 0,
+                    '16k-32k': 0,
+                    '32k-64k': 0
+                 },
                  short_document_start=0,
                  short_document_end=None,
+                 seed=42,
                  ):
         
         self.root = root
         self.longdoc_root = longdoc_root
         self.max_length = max_length
         self.min_length = min_length
+        self.longdoc_min_length = longdoc_min_length if longdoc_min_length is not None else min_length
         self.num_tokens = num_tokens
         self.end_special_token = end_special_token
         self.add_special_tokens = add_special_tokens
@@ -101,12 +111,20 @@ class MixedStreamDataset(IterableDataset):
         self.repeat_with_unrelated = repeat_with_unrelated
         self.max_unrelated_at_one_step = max_unrelated_at_one_step
         self.force_num_of_contexts = force_num_of_contexts
+        self.min_seq_length_for_full_context_and_sentence = min_seq_length_for_full_context_and_sentence
+
+        self.long_doc_start_chunk = long_doc_start_chunk
+
         if self.repeat_with_unrelated:
             self.unrelated_contexts = []
 
         assert not (self.target_is_context_ratio > 0 and self.target_is_context), "you cannot set target_is_context_ratio > 0 and target_is_context=True at the same time!"
 
-        self.ds = load_dataset(root, name=name, split=split, trust_remote_code=True)
+        if "local_data" in name:
+            self.ds = load_from_disk(name)
+        else:
+            self.ds = load_dataset(root, name=name, split=split, trust_remote_code=True)
+
          # select the examples from 50000 to the last
         self.ds = self.ds.select(range(50000, len(self.ds)))
         short_document_end = short_document_end if short_document_end is not None else len(self.ds)
@@ -114,7 +132,7 @@ class MixedStreamDataset(IterableDataset):
         self.short_document_length = len(self.ds)
 
         # shuffle self.ds
-        self.ds = self.ds.shuffle(seed=42)
+        self.ds = self.ds.shuffle(seed=seed)
 
         # Calculate the number of long documents needed for each category
         self.long_documents_ratios = long_documents_ratios
@@ -135,10 +153,12 @@ class MixedStreamDataset(IterableDataset):
             keys += [key] * count
             # determine how many chunks to use
             num_chunks = int(np.ceil(count / 1000))
-            self.key2chunk[key] = [str(i) for i in range(num_chunks)]
+            self.key2chunk[key] = [str(i + self.long_doc_start_chunk[key]) for i in range(num_chunks)]
         
         # shuffle the keys
-        random.shuffle(keys)
+        # random.shuffle(keys)
+        # shuffle the keys with the seed
+        random.Random(seed).shuffle(keys)
         self.keys = keys
 
         self.key2count = {key: 0 for key in ['short'] + list(self.long_documents_counts.keys())}
@@ -187,18 +207,18 @@ class MixedStreamDataset(IterableDataset):
             
             self.key2count[key] += 1
             
-            if self.target_is_context or random.random() < self.target_is_context_ratio:
-                output = self.get_repeat_context_sentence(doc)
-            else:
-                output = self.get_context_and_sentence(doc)
-            
+            output = self.get_context_and_sentence(doc, min_length=self.min_length if key == "short" else self.longdoc_min_length)
             if output is None:
                 continue
-                
+
             contexts, sentence, label = output
+            if label == 1:
+                if self.target_is_context or random.random() < self.target_is_context_ratio:
+                    label = 4
+
             yield contexts, sentence, label
 
-    def get_context_and_sentence(self, doc, return_doc=False):
+    def get_context_and_sentence(self, doc, min_length, return_doc=False):
         
         if return_doc:
             contexts = [self.tokenizer(doc + self.end_special_token, 
@@ -211,11 +231,14 @@ class MixedStreamDataset(IterableDataset):
         
         doc = self.tokenizer(doc + self.end_special_token, return_tensors='pt', truncation=False, add_special_tokens=False).input_ids[0]
 
-        if len(doc) < self.min_length:
-            return None
+        if len(doc) < min_length:
+            if len(doc) > self.min_seq_length_for_full_context_and_sentence:
+                return [doc], doc, 5
+            else:
+                return None
 
         if len(doc) < self.max_seq_length:
-            chunks = split_sequence(len(doc), self.min_length, self.max_length)
+            chunks = split_sequence(len(doc), min_length, self.max_length)
             if len(chunks) == 1:
                 return None
                 
@@ -228,18 +251,18 @@ class MixedStreamDataset(IterableDataset):
 
         else:
 
-            if len(doc) < self.max_seq_length + self.min_length:
-                contexts = [doc[:self.min_length]]
-                sentence = doc[self.min_length:]
+            if len(doc) < self.max_seq_length + min_length:
+                contexts = [doc[:min_length]]
+                sentence = doc[min_length:]
             else:
 
-                seq_length = random.randint(self.min_length, self.max_seq_length)
+                seq_length = random.randint(min_length, self.max_seq_length)
                 
                 sentence = doc[-seq_length:]
                 doc = doc[:-seq_length]
 
-                assert len(doc) >= self.min_length
-                chunks = split_sequence(len(doc), self.min_length, self.max_length)
+                assert len(doc) >= min_length
+                chunks = split_sequence(len(doc), min_length, self.max_length)
 
                 contexts = []
                 for chunk in chunks:
@@ -256,11 +279,11 @@ class MixedStreamDataset(IterableDataset):
 
         return contexts, sentence, 1
 
-    def get_repeat_context_sentence(self, doc):
+    def get_repeat_context_sentence(self, doc, min_length):
 
         if self.repeat_with_unrelated:
 
-            contexts, sentence = self.get_context_and_sentence(doc, return_doc=True)
+            contexts, sentence = self.get_context_and_sentence(doc, min_length=min_length, return_doc=True)
 
             # randomly pick some contexts from self.unrelated_contexts:
             num_unrelated = min(self.max_unrelated_at_one_step, len(self.unrelated_contexts))
@@ -281,7 +304,7 @@ class MixedStreamDataset(IterableDataset):
         
         else:
 
-            output = self.get_context_and_sentence(doc)
+            output = self.get_context_and_sentence(doc, min_length=min_length)
             if output is None:
                 return None
             contexts, sentence, _ = output

@@ -13,6 +13,7 @@ class LongContextDataset(Dataset):
                 num=None,
                 is_ift=False,
                 tokenizer_path=None,
+                max_chunk_length=512,
                 max_length=8192,
                 prompt_format_path="longbench_config/dataset2prompt_mem.json",
                 maxlen_path="longbench_config/dataset2maxlen.json",):
@@ -26,6 +27,7 @@ class LongContextDataset(Dataset):
         dataset2prompt = json.load(open(prompt_format_path))
         dataset2maxlen = json.load(open(maxlen_path))
         self.max_length = max_length
+        self.max_chunk_length = max_chunk_length
         self.prompt_format = dataset2prompt[dataset]
         self.gen_maxlen = dataset2maxlen[dataset]
 
@@ -53,8 +55,8 @@ class LongContextDataset(Dataset):
                 contexts_ids.append(prompt_ids[-(2048-self.gen_maxlen):])
                 prompt_ids = prompt_ids[:-(2048-self.gen_maxlen)]
             else:
-                contexts_ids.append(prompt_ids[-512:])
-                prompt_ids = prompt_ids[:-512]
+                contexts_ids.append(prompt_ids[-self.max_chunk_length:])
+                prompt_ids = prompt_ids[:-self.max_chunk_length]
 
         contexts_ids = contexts_ids[::-1]
         
