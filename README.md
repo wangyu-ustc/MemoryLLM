@@ -22,6 +22,7 @@ This is the official implementation of paper **MemoryLLM: Towards Self-Updatable
 The model is open-sourced at https://huggingface.co/YuWangX/memoryllm-7b -->
 
 ## Release Notes
+- [2025/07/27] 🔥 Updated the training code of `mplus-8b` and open-sourced at [mplus-8b-branch](https://github.com/wangyu-ustc/MemoryLLM/tree/mplus).
 - [2025/02/07] 🔥 The model `mplus-8b` has been uploaded to [mplus-8b](https://huggingface.co/YuWangX/mplus-8b).
 - [2025/02/01] 🔥 New paper [M+: Extending MemoryLLM with Scalable Long-Term Memory](https://arxiv.org/abs/2502.00592) is on Arxiv! 
 - [2024/08/30] 🔥 We release [memoryllm-8b-chat](https://huggingface.co/YuWangX/memoryllm-8b-chat), the chat model built on top of [memoryllm-8b](https://huggingface.co/YuWangX/memoryllm-8b).
